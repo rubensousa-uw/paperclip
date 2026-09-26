@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SsoProviderConfig } from "@paperclipai/shared";
-import { DEFAULT_OIDC_SCOPES, mapSsoProviderToOAuthConfig } from "../auth/better-auth.js";
+import { buildSsoAccountOptions, DEFAULT_OIDC_SCOPES, mapSsoProviderToOAuthConfig } from "../auth/better-auth.js";
 
 const GENERIC_OIDC: SsoProviderConfig = {
   providerId: "google",
@@ -24,5 +24,21 @@ describe("mapSsoProviderToOAuthConfig: generic oidc scopes", () => {
   it("keeps an explicit scope list", () => {
     const config = mapSsoProviderToOAuthConfig({ ...GENERIC_OIDC, scopes: ["openid", "email", "groups"] });
     expect(config.scopes).toEqual(["openid", "email", "groups"]);
+  });
+});
+
+describe("buildSsoAccountOptions", () => {
+  it("returns nothing when no SSO provider is configured", () => {
+    expect(buildSsoAccountOptions([])).toEqual({});
+  });
+
+  it("nests accountLinking under account, where Better Auth reads it", () => {
+    const options = buildSsoAccountOptions([GENERIC_OIDC]) as {
+      accountLinking?: unknown;
+      account?: { accountLinking?: { enabled?: boolean; trustedProviders?: string[] } };
+    };
+    expect(options.accountLinking).toBeUndefined();
+    expect(options.account?.accountLinking?.enabled).toBe(true);
+    expect(options.account?.accountLinking?.trustedProviders).toEqual(["google"]);
   });
 });

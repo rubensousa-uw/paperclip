@@ -316,6 +316,23 @@ export function withRoleRestrictedUserInfo(
   return baseConfig;
 }
 
+/**
+ * Better Auth reads account linking from `options.account.accountLinking`
+ * (see `better-auth/dist/oauth2/link-account.mjs`). A top-level
+ * `accountLinking` key is silently ignored.
+ */
+export function buildSsoAccountOptions(providers: SsoProviderConfig[]): Record<string, unknown> {
+  if (providers.length === 0) return {};
+  return {
+    account: {
+      accountLinking: {
+        enabled: true,
+        trustedProviders: providers.map((p) => p.providerId),
+      },
+    },
+  };
+}
+
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
@@ -356,14 +373,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       disableSignUp: config.authDisableSignUp,
     },
     ...(plugins.length > 0 ? { plugins } : {}),
-    ...(oauthConfigs.length > 0
-      ? {
-          accountLinking: {
-            enabled: true,
-            trustedProviders: config.ssoProviders.map((p) => p.providerId),
-          },
-        }
-      : {}),
+    ...buildSsoAccountOptions(config.ssoProviders),
     rateLimit: buildBetterAuthRateLimitOptions({
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
