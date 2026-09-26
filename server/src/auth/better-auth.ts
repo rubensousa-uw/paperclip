@@ -327,6 +327,12 @@ export function buildSsoAccountOptions(providers: SsoProviderConfig[]): Record<s
     account: {
       accountLinking: {
         enabled: true,
+        // Better Auth defaults this to true, i.e. it only links an SSO identity
+        // to a local account whose email is already verified. Paperclip runs
+        // with `requireEmailVerification: false`, so no local account is ever
+        // verified and linking would always be refused. Proof of the address
+        // moves to the IdP, and only for the configured trustedProviders.
+        requireLocalEmailVerified: false,
         trustedProviders: providers.map((p) => p.providerId),
       },
     },

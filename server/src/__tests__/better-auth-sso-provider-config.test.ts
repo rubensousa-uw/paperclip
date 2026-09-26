@@ -41,4 +41,11 @@ describe("buildSsoAccountOptions", () => {
     expect(options.account?.accountLinking?.enabled).toBe(true);
     expect(options.account?.accountLinking?.trustedProviders).toEqual(["google"]);
   });
+
+  it("does not require a verified local email, since Paperclip never verifies local emails", () => {
+    const options = buildSsoAccountOptions([GENERIC_OIDC]) as {
+      account?: { accountLinking?: { requireLocalEmailVerified?: boolean } };
+    };
+    expect(options.account?.accountLinking?.requireLocalEmailVerified).toBe(false);
+  });
 });
