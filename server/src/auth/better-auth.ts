@@ -188,7 +188,9 @@ function userHasRequiredRole(
   return false;
 }
 
-function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthConfig {
+export const DEFAULT_OIDC_SCOPES = ["openid", "email", "profile"] as const;
+
+export function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthConfig {
   const base = {
     clientId: provider.clientId,
     clientSecret: provider.clientSecret,
@@ -219,6 +221,11 @@ function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthC
         providerId: provider.providerId,
         discoveryUrl: provider.discoveryUrl!,
         ...base,
+        // Unlike the keycloak/auth0/okta/entra helpers, the generic branch has no
+        // default scopes. Without them the authorization request carries no
+        // `scope` parameter and strict IdPs (e.g. Google) reject it with
+        // "Missing required parameter: scope". An explicit, non-empty list wins.
+        scopes: provider.scopes?.length ? provider.scopes : [...DEFAULT_OIDC_SCOPES],
       };
       break;
   }
