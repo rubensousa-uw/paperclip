@@ -156,6 +156,12 @@ export function CompanySettingsSidebar() {
               end
             />
           )}
+          <SidebarNavItem
+            to={`${INSTANCE_SETTINGS_PATH_PREFIX}/sso`}
+            label="SSO"
+            icon={Shield}
+            end
+          />
           {showPage("company.export") && (
             <SidebarNavItem to="/company/export" label="Export" icon={Download} />
           )}

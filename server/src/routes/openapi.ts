@@ -225,6 +225,7 @@ import {
   // Instance settings
   patchInstanceGeneralSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
+  patchInstanceSsoSettingsSchema,
   patchInstanceSettingsSchema,
   startTaskDrainRequestSchema,
   // Resource memberships
@@ -6804,6 +6805,23 @@ registry.registerPath({
   summary:
     "Unarchive the Cloud-pinned primary company (idempotent); used by the Cloud control plane while restoring an archived stack",
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/settings/sso",
+  tags: ["instance"],
+  summary: "Get instance SSO settings",
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/instance/settings/sso",
+  tags: ["instance"],
+  summary: "Update instance SSO settings",
+  request: { body: jsonBody(patchInstanceSsoSettingsSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 // ─── Board chat (Conference Room Chat, experimental) ──────────────────────────

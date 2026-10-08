@@ -19,6 +19,8 @@ import {
   type InstanceGeneralSettings,
   instanceExperimentalSettingsSchema,
   type InstanceExperimentalSettings,
+  instanceSsoSettingsSchema,
+  type InstanceSsoSettings,
   type InstanceExperimentalSettingsWithManaged,
   type ManagedExperimentalFeatureKey,
   type ManagedSettingMetadata,
@@ -26,6 +28,7 @@ import {
   type InstanceSettings,
   type PatchInstanceSettings,
   type PatchInstanceExperimentalSettings,
+  type PatchInstanceSsoSettings,
 } from "@paperclipai/shared";
 import {
   INSTANCE_FEATURE_CATALOG,
@@ -320,6 +323,17 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
   };
 }
 
+function normalizeSsoSettings(raw: unknown): InstanceSsoSettings {
+  const parsed = instanceSsoSettingsSchema.safeParse(raw ?? {});
+  if (parsed.success) {
+    return {
+      enabled: parsed.data.enabled ?? false,
+      providers: parsed.data.providers ?? [],
+    };
+  }
+  return { enabled: false, providers: [] };
+}
+
 export type ManagedExperimentalKeyMetadata = Partial<
   Record<ManagedExperimentalFeatureKey, ManagedSettingMetadata>
 >;
@@ -458,6 +472,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       defaultEnvironmentId: row.defaultEnvironmentId ?? null,
       general: toGeneralView(row.general),
       experimental: toExperimentalView(row.experimental),
+      sso: normalizeSsoSettings(row.sso),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     } as InstanceSettings;
@@ -477,6 +492,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         singletonKey: DEFAULT_SINGLETON_KEY,
         general: {},
         experimental: {},
+        sso: {},
         createdAt: now,
         updatedAt: now,
       })
@@ -577,6 +593,27 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         .update(instanceSettings)
         .set({
           experimental: { ...nextExperimental },
+          updatedAt: now,
+        })
+        .where(eq(instanceSettings.id, current.id))
+        .returning();
+      return toInstanceSettings(updated ?? current);
+    },
+
+    getSso: async (): Promise<InstanceSsoSettings> => {
+      const row = await getOrCreateRow();
+      return normalizeSsoSettings(row.sso);
+    },
+
+    updateSso: async (patch: PatchInstanceSsoSettings): Promise<InstanceSettings> => {
+      const current = await getOrCreateRow();
+      const currentSso = normalizeSsoSettings(current.sso);
+      const nextSso = normalizeSsoSettings({ ...currentSso, ...patch });
+      const now = new Date();
+      const [updated] = await db
+        .update(instanceSettings)
+        .set({
+          sso: { ...nextSso } as Record<string, unknown>,
           updatedAt: now,
         })
         .where(eq(instanceSettings.id, current.id))

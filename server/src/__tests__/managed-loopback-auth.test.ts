@@ -1,4 +1,5 @@
-import { createDb } from "@paperclipai/db";
+import { createHash } from "node:crypto";
+import { createDb, invites } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Config } from "../config.js";
 import { createBetterAuthInstance } from "../auth/better-auth.js";
@@ -55,12 +56,21 @@ describeEmbeddedPostgres("managed runtime loopback auth cookies", () => {
     vi.stubEnv("PAPERCLIP_PUBLIC_URL", "");
 
     const db = createDb(tempDb!.connectionString);
+    const inviteToken = "pcp_bootstrap_managed-loopback-auth-test";
+    await db.insert(invites).values({
+      inviteType: "bootstrap_ceo",
+      tokenHash: createHash("sha256").update(inviteToken).digest("hex"),
+      allowedJoinTypes: "human",
+      expiresAt: new Date(Date.now() + 60_000),
+      invitedByUserId: "system",
+    });
     const config = {
       deploymentMode: "authenticated",
       deploymentExposure: "private",
       authBaseUrlMode: "explicit",
       authPublicBaseUrl: publicOrigin,
       authDisableSignUp: false,
+      ssoProviders: [],
     } as Config;
     const auth = createBetterAuthInstance(db, config, [publicOrigin, loopbackOrigin]);
     const credentials = {
@@ -72,6 +82,7 @@ describeEmbeddedPostgres("managed runtime loopback auth cookies", () => {
     const signUpResponse = await auth.handler(authRequest(publicOrigin, "/sign-up/email", {
       method: "POST",
       body: JSON.stringify(credentials),
+      headers: { referer: `${publicOrigin}/invite/${inviteToken}` },
     }));
     expect(signUpResponse.status).toBe(200);
     expect(sessionCookie(signUpResponse)).toMatch(/;\s*Secure(?:;|$)/i);
