@@ -613,7 +613,7 @@ export function createBetterAuthHandler(auth: BetterAuthHandlerTarget): RequestH
 
 export interface BetterAuthManager {
   handler: RequestHandler;
-  fetch: (request: Request) => Promise<Response>;
+  fetch: (request: globalThis.Request) => Promise<Response>;
   resolveSession: (req: Request) => Promise<BetterAuthSessionResult | null>;
   resolveSessionFromHeaders: (headers: Headers) => Promise<BetterAuthSessionResult | null>;
   rebuild: (ssoProviders: SsoProviderConfig[]) => Promise<void>;
@@ -767,7 +767,7 @@ export async function createBetterAuthManager(
     return installedProviders.some((provider) => provider.providerId === providerId);
   };
 
-  const handleFetch = async (request: Request): Promise<Response> => {
+  const handleFetch = async (request: globalThis.Request): Promise<Response> => {
     const url = new URL(request.url);
     if (request.method === "POST" && /\/sign-in\/(?:oauth2|social)$/.test(url.pathname)) {
       let body: unknown;
