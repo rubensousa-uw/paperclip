@@ -161,7 +161,9 @@ export const instanceSsoSettingsSchema = z.object({
   providers: ssoProvidersSchema.default([]),
 });
 
-export const patchInstanceSsoSettingsSchema = instanceSsoSettingsSchema.partial();
+export const patchInstanceSsoSettingsSchema = z
+  .object(shapeWithoutDefaults(instanceSsoSettingsSchema.shape))
+  .partial();
 
 export type InstanceGeneralSettings = z.infer<typeof instanceGeneralSettingsSchema>;
 // The patch schema removes each default so an absent key stays absent. Declare
@@ -176,7 +178,7 @@ export type PatchInstanceExperimentalSettings = Partial<
 >;
 export type PatchInstanceSettings = z.infer<typeof patchInstanceSettingsSchema>;
 export type StartTaskDrainRequest = z.infer<typeof startTaskDrainRequestSchema>;
-export type PatchInstanceSsoSettings = z.infer<typeof patchInstanceSsoSettingsSchema>;
+export type PatchInstanceSsoSettings = Partial<z.infer<typeof instanceSsoSettingsSchema>>;
 
 export const instanceSettingsSchema = z.object({
   id: z.string().guid(),
