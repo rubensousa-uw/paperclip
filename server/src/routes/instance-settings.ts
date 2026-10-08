@@ -535,7 +535,7 @@ export function instanceSettingsRoutes(
       const updated = await svc.updateSso(req.body);
 
       const activeProviders = updated.sso.enabled ? updated.sso.providers : [];
-      opts?.onSsoSettingsChanged?.(activeProviders);
+      await opts?.onSsoSettingsChanged?.(activeProviders);
 
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();

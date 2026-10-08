@@ -521,7 +521,7 @@ export async function createApp(
     hostVersion?: string;
     localPluginDir?: string;
     ssoProviders?: SsoProviderConfig[];
-    onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void;
+    onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void | Promise<void>;
     pluginMigrationDb?: Db;
     pluginWorkerManager?: PluginWorkerManager;
     decisionServiceOptions: DecisionServiceOptions;
