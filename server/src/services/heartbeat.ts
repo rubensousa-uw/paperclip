@@ -574,6 +574,7 @@ import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
   shouldCancelRunsForNonInvokableAgent,
+  isAgentInvokabilityConflict,
   DIRECT_NON_INVOKABLE_STATUSES,
   type AgentOrgRow,
 } from "./agent-invokability.js";
@@ -19673,6 +19674,13 @@ export function heartbeatService(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
       await resumeQueuedCommentInterrupt(wake.companyId, wake.id).catch(err => {
+        // A non-invokable agent is not a failure here: the queue keeps its
+        // deferred row and the saved comments are delivered when the agent is
+        // invokable again. Say so, instead of logging it as a broken queue.
+        if (isAgentInvokabilityConflict(err)) {
+          logger.warn({ err, queueId: wake.id }, "interrupted comment queue deferred: agent is not invokable");
+          return;
+        }
         logger.warn({ err, queueId: wake.id }, "failed to resume interrupted comment queue");
       });
     }
@@ -19709,6 +19717,12 @@ export function heartbeatService(
         latest.errorCode === "execution_reconciliation_required";
       if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
         await resumeSavedLegacyComments(wake.companyId, wake.id).catch(err => {
+          // Same reading as above: the per-item catch already keeps one queue
+          // from abandoning the rest, and a non-invokable agent is a deferral.
+          if (isAgentInvokabilityConflict(err)) {
+            logger.warn({ err, queueId: wake.id }, "saved legacy comments deferred: agent is not invokable");
+            return;
+          }
           logger.warn({ err, queueId: wake.id }, "failed to deliver saved legacy comment after recovery stopped");
         });
       }
@@ -19762,7 +19776,7 @@ export function heartbeatService(
 
   async function recoverActiveSessionGoals() {
     if ((await getSchedulingSuppression()).suppressed) {
-      return { scanned: 0, enqueued: 0 };
+      return { scanned: 0, enqueued: 0, deferred: 0 };
     }
     const sessions = await db
       .select({
@@ -19789,24 +19803,39 @@ export function heartbeatService(
         ),
       );
     let enqueued = 0;
+    let deferred = 0;
     for (const session of sessions) {
-      const run = await enqueueWakeup(session.agentId, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "goal_control",
-        payload: { issueId: session.issueId, intent: "goal_recovery" },
-        idempotencyKey: `goal_recovery:${session.id}:${session.revision}`,
-        requestedByActorType: "system",
-        contextSnapshot: {
-          issueId: session.issueId,
-          taskKey: session.issueId,
-          resumeSessionGoalHeartbeat: true,
-          skipIssueComment: true,
-        },
-      });
-      if (run) enqueued += 1;
+      try {
+        const run = await enqueueWakeup(session.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "goal_control",
+          payload: { issueId: session.issueId, intent: "goal_recovery" },
+          idempotencyKey: `goal_recovery:${session.id}:${session.revision}`,
+          requestedByActorType: "system",
+          contextSnapshot: {
+            issueId: session.issueId,
+            taskKey: session.issueId,
+            resumeSessionGoalHeartbeat: true,
+            skipIssueComment: true,
+          },
+        });
+        if (run) enqueued += 1;
+      } catch (err) {
+        // One non-invokable agent must not abandon the other goals, and must
+        // not fail startup: that is what kept the server from reaching
+        // /api/health. The goal stays active and the `skipped` receipt this
+        // leaves behind carries no idempotency exclusivity, so the same key is
+        // offered again on the next pass once the agent is invokable.
+        if (!isAgentInvokabilityConflict(err)) throw err;
+        deferred += 1;
+        logger.warn(
+          { err, sessionId: session.id, agentId: session.agentId },
+          "session goal recovery deferred: agent is not invokable",
+        );
+      }
     }
-    return { scanned: sessions.length, enqueued };
+    return { scanned: sessions.length, enqueued, deferred };
   }
 
   async function recoverPendingSessionGoalActions() {

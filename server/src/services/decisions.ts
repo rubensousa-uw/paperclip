@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, count, desc, eq, gt, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, gte, inArray, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companyMemberships, decisionBundles, decisionEffectExecutions, decisionRetention, decisions, decisionTargetIssues, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
 import { ATTENTION_SOURCE_KINDS, decisionEffectTargetIssueIds } from "@paperclipai/shared";
 import type { AttentionArchiveManifestEntry, DecisionEffect, DecisionInput, DecisionOption, DecisionStatsCounts, DecisionStatsResponse } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, tooManyRequests, unprocessable } from "../errors.js";
+import { isAgentInvokabilityConflict } from "./agent-invokability.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { signDecisionSpec, verifyDecisionSpec } from "./decision-signing.js";
@@ -19,6 +20,15 @@ type Snapshot = { status: string; assigneeAgentId: string | null; assigneeUserId
 type Wake = (input: { companyId: string; agentId: string; issueId: string; decisionId: string; outcome: "decided" | "expired" | "cancelled" }) => Promise<unknown>;
 export type DecisionServiceOptions = { wakeOriginAgent: Wake };
 const DAY = 86_400_000;
+
+// How many times one sweep re-reads the pending continuations with the rows an
+// earlier pass found blocked excluded. Bounded so a backlog of stuck rows costs
+// a fixed number of queries; the excluded rows stay pending either way.
+const CONTINUATION_DELIVERY_PASSES = 10;
+
+function continuationOutcome(decision: { status: string }): "decided" | "expired" | "cancelled" {
+  return decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled" : "decided";
+}
 
 function targetIds(options: DecisionOption[]) {
   const result = new Set<string>();
@@ -120,6 +130,7 @@ function boardCanActDirectly(actor: AuthorizationActor, companyId: string) {
 export function decisionService(db: Db, options: DecisionServiceOptions) {
   const authz = authorizationService(db);
   let targetSweepCursor: string | null = null;
+  let continuationSweepCursor: { updatedAt: Date; id: string } | null = null;
   type CreateInput = { companyId: string; actor: AuthorizationActor; agentId: string; runId: string; bundleId?: string | null;
     ruleKey?: string | null; title: string; body: string; options: DecisionOption[]; inputs?: DecisionInput[] | null; expiresAt?: Date | null;
     idempotencyKey?: string | null; continuationPolicy?: "none" | "wake_origin_agent"; metadata?: Record<string, unknown> };
@@ -732,21 +743,63 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         lte(decisions.updatedAt, new Date(now.getTime() - recoveryGraceMs))))
       .orderBy(asc(decisions.updatedAt)).limit(batchSize);
     let resumed = 0;
+    let deferredContinuations = 0;
     for (const decision of runningRows) {
       if (!decision.decidedByUserId) continue;
-      const recovered = await runEffects(decision, await recoveryActor(decision.companyId, decision.decidedByUserId));
-      if (recovered.executionStatus === "running") continue;
-      resumed += 1;
-      await deliverContinuation(recovered, "decided");
+      try {
+        const recovered = await runEffects(decision, await recoveryActor(decision.companyId, decision.decidedByUserId));
+        if (recovered.executionStatus === "running") continue;
+        resumed += 1;
+        await deliverContinuation(recovered, "decided");
+      } catch (err) {
+        if (!isAgentInvokabilityConflict(err)) throw err;
+        deferredContinuations += 1;
+      }
     }
-    const pendingContinuations = await db.select().from(decisions)
-      .where(and(eq(decisions.continuationPolicy, "wake_origin_agent"),
-        sql`${decisions.metadata} ->> 'continuationPending' = 'true'`,
-        or(inArray(decisions.status, ["expired", "cancelled"]), and(eq(decisions.status, "decided"),
-          inArray(decisions.executionStatus, ["succeeded", "partial", "failed"])))))
-      .orderBy(asc(decisions.updatedAt)).limit(batchSize);
-    for (const decision of pendingContinuations) {
-      await deliverContinuation(decision, decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled" : "decided");
+    const deliverPendingContinuations = async (exclude: string[]) => {
+      const rows = await db.select().from(decisions)
+        .where(and(eq(decisions.continuationPolicy, "wake_origin_agent"),
+          sql`${decisions.metadata} ->> 'continuationPending' = 'true'`,
+          exclude.length > 0 ? notInArray(decisions.id, exclude) : undefined,
+          continuationSweepCursor ? or(
+            gt(decisions.updatedAt, continuationSweepCursor.updatedAt),
+            and(eq(decisions.updatedAt, continuationSweepCursor.updatedAt), gt(decisions.id, continuationSweepCursor.id)),
+          ) : undefined,
+          or(inArray(decisions.status, ["expired", "cancelled"]), and(eq(decisions.status, "decided"),
+            inArray(decisions.executionStatus, ["succeeded", "partial", "failed"])))))
+        .orderBy(asc(decisions.updatedAt), asc(decisions.id)).limit(batchSize);
+      const blocked: string[] = [];
+      for (const decision of rows) {
+        try {
+          await deliverContinuation(decision, continuationOutcome(decision));
+        } catch (err) {
+          // `deliverContinuation` wakes the origin agent before it clears
+          // `continuationPending`, so this 409 is what leaves the origin record
+          // pending: the decision is delivered once the agent is invokable
+          // again. Any other error still aborts the sweep, as it always did.
+          if (!isAgentInvokabilityConflict(err)) throw err;
+          blocked.push(decision.id);
+          deferredContinuations += 1;
+        }
+      }
+      // Carry the bounded scan forward across sweeps too: a backlog larger
+      // than ten batches must not pin every sweep to the same blocked prefix.
+      const last = rows.at(-1);
+      continuationSweepCursor = blocked.length > 0 && last
+        ? { updatedAt: last.updatedAt, id: last.id }
+        : null;
+      return blocked;
+    };
+    // This selection is ordered by `updatedAt` with a limit and the rows it
+    // does not touch are not skipped, so continuations stuck on non-invokable
+    // agents would hold back every other agent's continuation indefinitely.
+    // Re-read within the same sweep with the blocked rows excluded, so an
+    // invokable agent's continuation is delivered in the same pass.
+    let excludedContinuations: string[] = [];
+    for (let pass = 0; pass < CONTINUATION_DELIVERY_PASSES; pass += 1) {
+      const blocked = await deliverPendingContinuations(excludedContinuations);
+      if (blocked.length === 0) break;
+      excludedContinuations = [...excludedContinuations, ...blocked];
     }
     const ttlRows = await db.select().from(decisions)
       .where(and(eq(decisions.status, "open"), lte(decisions.expiresAt, now)))
@@ -778,8 +831,12 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         ...(decision.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } }).where(and(eq(decisions.id, decision.id), eq(decisions.status, "open"))).returning();
       if (!updated) continue; expired += 1;
       await logActivity(db, { companyId: updated.companyId, actorType: "system", actorId: "decision-expiry-sweeper", agentId: updated.originAgentId, runId: updated.originRunId, action: "decision.expired", entityType: "decision", entityId: updated.id, details: { expiredReason: reason } });
-      await deliverContinuation(updated, "expired"); }
-    return { expired, resumed };
+      // The decision is already expired, so the origin record for this item is
+      // the pending continuation. A non-invokable origin agent must not take
+      // the other rows of this batch with it; the continuation stays pending.
+      try { await deliverContinuation(updated, "expired"); }
+      catch (err) { if (!isAgentInvokabilityConflict(err)) throw err; deferredContinuations += 1; } }
+    return { expired, resumed, deferredContinuations };
   }
 
   return { create, createBundle, get, list, stats, outcome, decide, cancel, dismiss, sweepExpired };

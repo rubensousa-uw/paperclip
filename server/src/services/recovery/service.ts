@@ -116,7 +116,7 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
-import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
+import { evaluateAgentInvokabilityFromDb, isAgentInvokabilityConflict } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -2151,7 +2151,7 @@ export function recoveryService(
     const issueIds: string[] = [];
     const seen = new Set<string>();
 
-    for (const candidate of candidates) {
+    for (const candidate of candidates) try {
       if (seen.has(candidate.id)) continue;
       seen.add(candidate.id);
 
@@ -2240,6 +2240,13 @@ export function recoveryService(
       } else {
         skipped += 1;
       }
+    } catch (err) {
+      if (!isAgentInvokabilityConflict(err)) throw err;
+      skipped += 1;
+      logger.warn(
+        { err, issueId: candidate.id },
+        "stranded issue recovery deferred: agent is not invokable",
+      );
     }
 
     return { assigned, skipped, issueIds };
@@ -3415,7 +3422,7 @@ export function recoveryService(
       skipped: 0,
       issueIds: [] as string[],
     };
-    for (const { action, issue } of rows) {
+    for (const { action, issue } of rows) try {
       const wakePolicy = parseObject(action.wakePolicy);
       const wakePolicyType = readNonEmptyString(wakePolicy.type);
       if (
@@ -3541,6 +3548,13 @@ export function recoveryService(
       // Legacy takeover actions remain readable and resolvable, but recovery no
       // longer schedules another agent-owned wake for them.
       result.skipped += 1;
+    } catch (err) {
+      if (!isAgentInvokabilityConflict(err)) throw err;
+      result.skipped += 1;
+      logger.warn(
+        { err, issueId: issue.id },
+        "stranded issue recovery deferred: agent is not invokable",
+      );
     }
     return result;
   }
@@ -4393,7 +4407,10 @@ export function recoveryService(
       }
     }
 
-    for (const issue of candidates) {
+    // Guard each item, including the legacy-disposition and interrupted-handoff
+    // lanes added in 1005. The source remains available for the next sweep;
+    // budget, database and provider errors retain their native propagation.
+    for (const issue of candidates) try {
       if (issue.originKind === "chat_channel") {
         await settleSlackConversation(db, issue.companyId, issue.id);
         const [current] = await db.select({ externalConversationState: externalConversationStateSql() })
@@ -5517,6 +5534,13 @@ export function recoveryService(
       } else {
         result.skipped += 1;
       }
+    } catch (err) {
+      if (!isAgentInvokabilityConflict(err)) throw err;
+      result.skipped += 1;
+      logger.warn(
+        { err, issueId: issue.id, agentId: issue.assigneeAgentId },
+        "stranded issue recovery deferred: agent is not invokable",
+      );
     }
 
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();

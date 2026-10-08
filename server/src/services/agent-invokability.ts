@@ -162,3 +162,45 @@ export function listInvalidOrgChainDescendantIds(
 export function shouldCancelRunsForNonInvokableAgent(result: AgentInvokability) {
   return !result.invokable && (result.reason === "terminated" || result.invalidOrgChain);
 }
+
+const INVOKABILITY_BLOCK_REASONS = new Set<string>([
+  "missing",
+  "paused",
+  "terminated",
+  "pending_approval",
+  "unknown_status",
+  "manager_missing",
+  "manager_company_mismatch",
+  "manager_terminated",
+  "reporting_cycle",
+  "reporting_chain_too_deep",
+]);
+
+const INVOKABILITY_MESSAGES = new Set<string>([
+  "Agent is not invokable in its current state",
+  "Agent is not invokable because its reporting chain is invalid",
+]);
+
+/**
+ * Recognises the 409 that `enqueueWakeup` throws for a non-invokable agent,
+ * so a batch recovery path can skip that one item and keep going.
+ *
+ * It is deliberately narrow. `enqueueWakeup` also throws `conflict` for a
+ * budget block, and recovery callers must keep aborting on every other error.
+ * A conflict therefore counts as invokability only when the reason the
+ * invokability check attached is one of its own reasons, or the message is one
+ * of the two it produces. Nothing here re-decides invokability: the agent's
+ * state is read once, by `evaluateAgentInvokability`, as before.
+ */
+export function isAgentInvokabilityConflict(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as { status?: unknown; message?: unknown; details?: unknown };
+  if (candidate.status !== 409) return false;
+  if (typeof candidate.message === "string" && INVOKABILITY_MESSAGES.has(candidate.message)) {
+    return true;
+  }
+  const details = candidate.details;
+  if (typeof details !== "object" || details === null) return false;
+  const reason = (details as { reason?: unknown }).reason;
+  return typeof reason === "string" && INVOKABILITY_BLOCK_REASONS.has(reason);
+}
