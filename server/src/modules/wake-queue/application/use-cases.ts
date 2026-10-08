@@ -546,8 +546,12 @@ async function runReleaseRecoveryTail(
         })
       : false;
 
+  // Both branches need this fact, and they are mutually exclusive by issue
+  // status, so one read serves both. The review-participant branch used to
+  // hard-code false, which let a review recovery that ended `succeeded` block an
+  // issue that was explicitly waiting on a blocker.
   const hasExplicitBlockerPath =
-    immediateApplies && !reviewParticipantApplies
+    immediateApplies || reviewParticipantApplies
       ? await transaction.hasExplicitBlockerPath({
           companyId: issue.companyId,
           issueId: issue.id,
@@ -585,6 +589,10 @@ async function runReleaseRecoveryTail(
       applies: reviewParticipantApplies,
       isExecutionReviewParticipantRecoveryRun:
         isExecutionReviewParticipantRecoveryRun(run),
+      hasExplicitBlockerPath,
+      // The review branch admits any terminal status, so the policy needs the
+      // outcome to tell a `succeeded` answer from a failure to retry.
+      participantRunSucceeded: run.status === "succeeded",
     },
     immediate: {
       applies: immediateApplies,

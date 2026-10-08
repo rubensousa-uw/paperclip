@@ -210,6 +210,19 @@ export type ReleaseRecoveryReviewParticipantFacts = {
   applies: boolean;
   /** True when the finishing run was itself a review-participant-recovery retry. */
   isExecutionReviewParticipantRecoveryRun: boolean;
+  /**
+   * True when an issue that blocks this one is still open. Optional so callers
+   * that predate the fact keep compiling; absent reads as false, which is the
+   * behaviour that predates it.
+   */
+  hasExplicitBlockerPath?: boolean;
+  /**
+   * True when the finishing participant run ended `succeeded`. A `failed`,
+   * `timed_out` or `cancelled` run is a retry, not the reviewer's answer, so
+   * it keeps the native behaviour. Optional for the same reason as
+   * `hasExplicitBlockerPath`: absent reads as false, which is native.
+   */
+  participantRunSucceeded?: boolean;
 };
 
 export type ReleaseRecoveryImmediateFacts = {
@@ -381,7 +394,25 @@ export function decideReleaseRecovery(facts: ReleaseRecoveryFacts): ReleaseRecov
       facts.suppressImmediateRecovery ||
       shared.hasExistingExecutionPath ||
       shared.hasPersistedMonitor ||
-      shared.suppressedByPauseHold
+      shared.suppressedByPauseHold ||
+      // An issue that is explicitly waiting on a blocker owns its own next
+      // action. A review-participant recovery that ended `succeeded` without a
+      // decision is the reviewer's answer, not a failure to retry, so blocking
+      // here stranded the issue until a human read the board.
+      //
+      // All three conjuncts, each for a measured reason:
+      //
+      // - the recovery branch also admits terminal runs whose `wakeReason` is
+      //   `execution_review_requested`/`execution_approval_requested`, i.e. the
+      //   very first review wake with no retry reason. Those are not a recovery
+      //   to be released; natively they fall through to
+      //   `queue_review_participant_recovery`.
+      // - `succeeded` only: a `failed`/`timed_out`/`cancelled` participant run
+      //   is a failure to retry, and the native blocked path recovers it.
+      // - the blocker only: without it the native `blocked` still stands.
+      (reviewParticipant.isExecutionReviewParticipantRecoveryRun === true &&
+        reviewParticipant.hasExplicitBlockerPath === true &&
+        reviewParticipant.participantRunSucceeded === true)
     ) {
       return { kind: "released" };
     }

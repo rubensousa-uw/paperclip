@@ -5034,6 +5034,19 @@ export function recoveryService(
         }
 
         if (
+          // A `succeeded` participant run is the reviewer's answer, not a
+          // failure to retry, and a persisted wait path (an open `blocks`
+          // predecessor, a scheduled monitor) owns the next action. Requeueing
+          // here would loop: a successful recovery never moves the automatic
+          // recovery counter, so every pass would enqueue another run.
+          participantLatestRun.status === "succeeded" &&
+          (await hasPersistedDurableWaitPath(issue, participantLatestRun))
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+
+        if (
           didAutomaticRecoveryFail(
             participantLatestRun,
             EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
