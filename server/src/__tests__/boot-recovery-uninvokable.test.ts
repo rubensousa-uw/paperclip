@@ -48,7 +48,10 @@ const testHome = await vi.hoisted(async () => {
 });
 
 vi.mock("../telemetry.ts", () => ({
-  getTelemetryClient: () => ({ track: vi.fn() }),
+  getTelemetryClient: () => ({
+    track: vi.fn(),
+    hashPrivateRef: vi.fn(() => "test-private-reference"),
+  }),
 }));
 vi.mock("@paperclipai/shared/telemetry", async () => {
   const actual = await vi.importActual<typeof import("@paperclipai/shared/telemetry")>("@paperclipai/shared/telemetry");
@@ -403,8 +406,21 @@ describePg("boot recovery with uninvokable agents holding pending wakes", () => 
     // delivery that follows it.
     expect(receipts.filter((row) => row.status === "skipped")).toHaveLength(0);
     const delivered = receipts.filter((row) => row.status !== "skipped");
-    expect(delivered.map((row) => row.status)).toContain("claimed");
-    expect(delivered.some((row) => row.reason === "goal_control")).toBe(true);
+    const goalReceipt = delivered.find((row) => row.reason === "goal_control");
+    expect(goalReceipt).toBeDefined();
+    // On native 1005, codex_local goal execution fails with
+    // direct_adapter_goal_controller_unavailable (heartbeat.ts). CAP-15
+    // guarantees wake delivery, so assert the goal run exists regardless of
+    // whether that run succeeds.
+    const goalRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, seeded.agentId),
+        eq(heartbeatRuns.wakeupRequestId, goalReceipt!.id),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${seeded.goalIssueId}`,
+      ));
+    expect(goalRuns).toHaveLength(1);
   };
 
   const assertDecisionContinuationDelivered = async (seeded: SeededEverything) => {
@@ -507,7 +523,8 @@ describePg("boot recovery with uninvokable agents holding pending wakes", () => 
       .select()
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, seeded.queueId));
-    expect(["coalesced", "claimed"]).toContain(queue!.status);
+    // A completed receipt also means the wake was delivered (CAP-15 asserts delivery, any outcome).
+    expect(["coalesced", "claimed", "completed"]).toContain(queue!.status);
     expect(queue!.runId).not.toBeNull();
 
     // And the successor turn is the delivery: it carries the saved comment id,
@@ -540,7 +557,8 @@ describePg("boot recovery with uninvokable agents holding pending wakes", () => 
         eq(agentWakeupRequests.reason, "issue_continuation_needed"),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${seeded.issueId}`,
       ));
-    expect(receipts.some((row) => ["queued", "claimed", "coalesced"].includes(row.status))).toBe(true);
+    // CAP-15 asserts wake delivery, regardless of the run outcome.
+    expect(receipts.some((row) => ["queued", "claimed", "coalesced", "completed"].includes(row.status))).toBe(true);
     expect((await runsOnIssue(seeded.agentId, seeded.issueId)).length).toBeGreaterThanOrEqual(2);
   };
 
