@@ -1,5 +1,7 @@
 import express from "express";
 import request from "supertest";
+import type { Db } from "@paperclipai/db";
+import { patchInstanceSsoSettingsSchema } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
@@ -711,6 +713,51 @@ describe("instance settings routes", () => {
       enabled: true,
     });
     expect(mockLogActivity).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves stored SSO providers when enabling SSO and applying an empty patch", async () => {
+    const { instanceSettingsService } = await vi.importActual<
+      typeof import("../services/instance-settings.js")
+    >("../services/instance-settings.js");
+    const providers = [{
+      providerId: "keycloak",
+      type: "keycloak",
+      clientId: "client",
+      clientSecret: "secret",
+      issuer: "https://idp.example.com/realms/main",
+    }];
+    const row = {
+      id: "instance-settings-1",
+      singletonKey: "default",
+      defaultEnvironmentId: null,
+      general: {},
+      experimental: {},
+      sso: { enabled: false, providers },
+      createdAt: new Date("2026-06-20T00:00:00.000Z"),
+      updatedAt: new Date("2026-06-20T00:00:00.000Z"),
+    };
+    // Keep the real service merge and capture the settings it persists.
+    const persistedSets: Array<Record<string, unknown>> = [];
+    const db = {
+      select: () => ({ from: () => ({ where: () => Promise.resolve([row]) }) }),
+      update: () => ({
+        set: (values: Record<string, unknown>) => {
+          persistedSets.push(values);
+          Object.assign(row, values);
+          return { where: () => ({ returning: () => Promise.resolve([row]) }) };
+        },
+      }),
+    } as unknown as Db;
+    const service = instanceSettingsService(db, { runtimeEnv: {} });
+
+    for (const patch of [{ enabled: true }, {}]) {
+      const updated = await service.updateSso(patchInstanceSsoSettingsSchema.parse(patch));
+      expect(updated.sso).toEqual({ enabled: true, providers });
+      expect(row.sso).toEqual({ enabled: true, providers });
+      expect(persistedSets.at(-1)?.sso).toEqual({ enabled: true, providers });
+    }
+    expect(persistedSets).toHaveLength(2);
+    expect(await service.getSso()).toEqual({ enabled: true, providers });
   });
 
   it("rejects non-admin board users from reading SSO settings", async () => {
