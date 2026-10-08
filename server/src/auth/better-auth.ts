@@ -620,6 +620,7 @@ export interface BetterAuthManager {
 }
 
 export const SSO_DISCOVERY_BOOT_TIMEOUT_MS = 10_000;
+export const SSO_DISCOVERY_READINESS_GUARD_MS = SSO_DISCOVERY_BOOT_TIMEOUT_MS + 5_000;
 const SSO_RECOVERY_COOLDOWN_MS = 60_000;
 
 export interface BetterAuthManagerOptions {
@@ -647,7 +648,7 @@ async function createReadyBetterAuthInstance(
   db: Db,
   config: Config,
   trustedOrigins: string[],
-  timeoutMs = SSO_DISCOVERY_BOOT_TIMEOUT_MS,
+  timeoutMs = SSO_DISCOVERY_READINESS_GUARD_MS,
 ): Promise<BetterAuthInstance> {
   let providers = [...config.ssoProviders];
   const originalProviderIds = new Set(providers.map((provider) => provider.providerId));
@@ -710,7 +711,7 @@ export async function createBetterAuthManager(
   trustedOrigins: string[],
   options: BetterAuthManagerOptions = {},
 ): Promise<BetterAuthManager> {
-  const timeoutMs = options.discoveryTimeoutMs ?? SSO_DISCOVERY_BOOT_TIMEOUT_MS;
+  const timeoutMs = options.discoveryTimeoutMs ?? SSO_DISCOVERY_READINESS_GUARD_MS;
   const now = options.now ?? Date.now;
   let configuredProviders = [...config.ssoProviders];
   let installedProviders = [...config.ssoProviders];
