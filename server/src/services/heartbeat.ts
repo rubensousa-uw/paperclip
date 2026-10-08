@@ -106,6 +106,7 @@ import {
   lt,
   lte,
   ne,
+  notExists,
   notInArray,
   or,
   sql,
@@ -9659,6 +9660,23 @@ export function heartbeatService(
     enqueueWakeup,
     liveRunExecutions,
     settleExplicitContinuationRetry: releaseIssueExecutionAndPromote,
+    // The stale-lock sweep clears an issue lock with a raw `UPDATE`. Without
+    // this the deferred-wake queue for that issue has no drain left, because
+    // `runReleaseDrain` only runs from `releaseIssueExecutionAndPromote`. Hand
+    // the sweep's cleared run back to that same admission so the queue drains.
+    releaseClearedIssueExecution: async ({ companyId, runId }) => {
+      await releaseIssueExecutionAndPromote({ id: runId, companyId }, {
+        suppressImmediateRecovery: true,
+      });
+    },
+    // The same native lease release `scanSilentActiveRuns` and the process-loss
+    // finalizer perform before they release the issue lock. Without it the run
+    // the sweep terminalizes keeps an environment lease, and that lease is an
+    // execution blocker of its own family — so the issue stays blocked by a run
+    // that no longer exists and its deferred queue has nothing to drain into.
+    releaseTerminalizedRunLeases: async (input) => {
+      await releaseEnvironmentLeasesForRun(input);
+    },
     scheduleRecoveryRetry: async (runId) => {
       const [run] = await db
         .select()
@@ -9669,6 +9687,15 @@ export function heartbeatService(
       if (!agent || agent.companyId !== run.companyId) return null;
       const result = await scheduleBoundedRetryForRun(run, agent);
       return result.outcome === "scheduled" ? result.run : null;
+    },
+    // #14752: use the native finalizer so only an agent with no other live
+    // runs leaves `running` after the backstop terminalizes its orphan.
+    finalizeTerminalizedRunAgentStatus: async (input) => {
+      await finalizeAgentStatus(
+        input.agentId,
+        input.outcome,
+        input.failureReason ?? null,
+      );
     },
     // Mirrors scheduleBoundedRetryForRun's transient budget check: a failed
     // or interrupted run that has already consumed every bounded transient
@@ -17546,6 +17573,23 @@ export function heartbeatService(
       });
       if (staleness.outcome === "cancelled") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        // The run is terminal now, so its environment lease goes with it. A
+        // cancellation that leaves the lease `active` on a terminal run keeps
+        // that run named as the issue's owner, and every later wake stays
+        // `deferred_issue_execution`. Best-effort: a failure here is logged and
+        // the cancellation still stands.
+        await releaseEnvironmentLeasesForRun({
+          runId: run.id,
+          companyId: run.companyId,
+          agentId: run.agentId,
+          status: "cancelled",
+          failureReason: staleness.reason,
+        }).catch((error) => {
+          logger.warn(
+            { err: error, runId: run.id, errorCode: staleness.errorCode },
+            "cancelled a stale run but could not release its environment lease",
+          );
+        });
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
@@ -19687,6 +19731,9 @@ export function heartbeatService(
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
+    //
+    // Also admit execution-wait wakes after their recovery blocker disappears.
+    // Preserve the existing saved-comment and interaction-response paths.
     const strandedQueues = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
@@ -19695,15 +19742,28 @@ export function heartbeatService(
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
-        or(and(
-          sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
-          sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
-        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
+        or(
+          and(
+            sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
+            sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
+          ),
+          sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
+          and(
+            sql`${agentWakeupRequests.payload}->'executionWait' is not null`,
+            notExists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+              eq(issueRecoveryActions.companyId, issues.companyId),
+              eq(issueRecoveryActions.sourceIssueId, issues.id),
+              executionBlockerPredicate(),
+            ))),
+          ),
+        ),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
-      if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
+      const queuedCommentIds = queuedCommentIdsFromWakePayload(wake.payload);
+      const strandedExecutionWait = queuedCommentIds.length === 0 && wake.payload?.executionWait != null;
+      if (!queuedCommentIds.length && !strandedExecutionWait &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
@@ -19715,7 +19775,9 @@ export function heartbeatService(
       if (!latest || latest.runtimeMode !== "legacy" || !isHeartbeatRunTerminalStatus(latest.status)) continue;
       const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
         latest.errorCode === "execution_reconciliation_required";
-      if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
+      if (!strandedExecutionWait &&
+          (latest.status !== "cancelled" || cancelledAdmission) &&
+          await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
         await resumeSavedLegacyComments(wake.companyId, wake.id).catch(err => {
           // Same reading as above: the per-item catch already keeps one queue
           // from abandoning the rest, and a non-invokable agent is a deferral.
@@ -19727,7 +19789,7 @@ export function heartbeatService(
         });
       }
       await releaseIssueExecutionAndPromote(latest, { suppressImmediateRecovery: true }).catch(err => {
-        logger.warn({ err, queueId: wake.id }, "failed to promote stranded legacy comments");
+        logger.warn({ err, queueId: wake.id }, "failed to promote stranded queue");
       });
     }
 
@@ -28945,6 +29007,24 @@ export function heartbeatService(
       // lookup must not delay them.
       for (const cancelledRun of cancelledRunsToEmit) {
         void emitAgentTaskRun(db, cancelledRun);
+        // A run cancelled by the stale-lock sweep — including
+        // `lock_released_on_reassignment` — is terminal, so its environment
+        // lease goes with it. Left `active`, that lease keeps the terminal run
+        // named as the issue's owner and every later wake is deferred forever.
+        // Awaited here, outside the transaction, because the release touches the
+        // provider and the lock columns are already committed either way.
+        await releaseEnvironmentLeasesForRun({
+          runId: cancelledRun.id,
+          companyId: cancelledRun.companyId,
+          agentId: cancelledRun.agentId,
+          status: cancelledRun.status,
+          failureReason: cancelledRun.error ?? undefined,
+        }).catch((error) => {
+          logger.warn(
+            { err: error, runId: cancelledRun.id, errorCode: cancelledRun.errorCode },
+            "cancelled a stale-lock run but could not release its environment lease",
+          );
+        });
       }
 
       if (outcome.kind === "durable") {
@@ -29920,6 +30000,29 @@ export function heartbeatService(
           level: "warn",
           message: options.eventMessage ?? "run cancelled",
           payload: { ...options.eventPayload, cancellation: readRunCancellation(cancelled.resultJson) },
+        });
+        // The run is terminal, so its environment lease goes with it, here and
+        // not in `executeRun`'s `finally`. That `finally` only runs once the
+        // cancelled process has actually exited, and a cancellation triggered
+        // from inside the run's own process — an agent reassigning the issue it
+        // is working on — never reaches it before the control plane wakes the
+        // next owner. In that window the lease is still `active` on a terminal
+        // run, so `getExecutionOwnershipBlocker` names it as the issue's owner
+        // and the `issue_assigned` wake to the new owner is refused and never
+        // retried. Releasing before the promotion below is what lets the
+        // promotion's own successor be admitted. Best-effort, like every other
+        // release: a failure is logged and the cancellation still stands.
+        await releaseEnvironmentLeasesForRun({
+          runId: cancelled.id,
+          companyId: cancelled.companyId,
+          agentId: cancelled.agentId,
+          status: cancelled.status,
+          failureReason: cancelled.error ?? undefined,
+        }).catch((error) => {
+          logger.warn(
+            { err: error, runId: cancelled.id, errorCode },
+            "cancelled a run but could not release its environment lease",
+          );
         });
         await releaseIssueExecutionAndPromote(cancelled, {
           suppressImmediateRecovery: options.suppressImmediateRecovery,

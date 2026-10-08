@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agentWakeupRequests,
@@ -235,6 +236,77 @@ describeEmbeddedPostgres("issue review attention", () => {
     expect(byId.get(humanOnlyInteractionIssueId)?.paths).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "interaction", responder: "Board" }),
     ]));
+  });
+
+  it("does not count an orphaned deferred wake as a maintained review path", async () => {
+    // The blind spot this pair of tests closes. A `queued_wake` whose issue no
+    // longer has a live run is a row nobody will ever promote, so counting it
+    // reported an `in_review` issue as `covered` on orphan rows alone — which
+    // is what stopped `review-path-recovery` from ever firing.
+    //
+    // Fixture independence: every id and time below is generated here. Nothing
+    // is copied from the incident that motivated the change.
+    const { companyId, agentId } = await seed();
+    const orphanIssueId = await insertReview({ companyId, agentId, identifier: "RVA-9" });
+    const liveRunIssueId = await insertReview({ companyId, agentId, identifier: "RVA-10" });
+
+    const orphanWakeId = randomUUID();
+    const liveWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: orphanWakeId,
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        // Parked: `deferred_issue_execution` with no run, no claim and no
+        // finish, on an issue whose execution lock is already cleared.
+        status: "deferred_issue_execution",
+        payload: { issueId: orphanIssueId },
+        requestedAt: new Date("2026-11-04T09:15:00.000Z"),
+      },
+      {
+        id: liveWakeId,
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        status: "deferred_issue_execution",
+        payload: { issueId: liveRunIssueId },
+        requestedAt: new Date("2026-11-04T09:16:00.000Z"),
+      },
+    ]);
+
+    // The negative control: a deferred queue that still has a live run holding
+    // the issue lock IS a maintained path, and must stay `covered`. Without it
+    // this gate would be a permanent false positive.
+    const liveRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: liveRunId,
+      companyId,
+      agentId,
+      status: "running",
+      contextSnapshot: { issueId: liveRunIssueId },
+    });
+    await db.update(issues)
+      .set({ executionRunId: liveRunId })
+      .where(eq(issues.id, liveRunIssueId));
+
+    const rows = await svc.list(companyId, { status: "in_review" });
+    const byId = new Map(rows.map((row) => [row.id, row.reviewAttention]));
+
+    // Chumba o estado medido: the orphan wake is not a path.
+    expect(byId.get(orphanIssueId)).toMatchObject({
+      state: "stalled",
+      paths: [],
+    });
+    // Não chumba: the deferred queue with a live run stays covered.
+    expect(byId.get(liveRunIssueId)).toMatchObject({
+      state: "covered",
+      paths: expect.arrayContaining([
+        expect.objectContaining({ kind: "queued_wake", ref: liveWakeId }),
+      ]),
+    });
   });
 
   it("does not let a transiently skipped recovery consume its fingerprint", async () => {

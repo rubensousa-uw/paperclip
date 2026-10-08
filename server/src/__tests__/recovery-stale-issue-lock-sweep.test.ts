@@ -127,7 +127,15 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       ...(withSettler ? { settleExplicitContinuationRetry } : {}),
     }).sweepStaleIssueLocks();
     expect(beforeOrphanedRunTerminalWrite).toHaveBeenCalledOnce();
-    expect(result).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+    expect(result).toEqual({
+      cleared: 0,
+      issueIds: [],
+      terminalizedRunIds: [],
+      releasedLeaseRunIds: [],
+      leaseReleaseFailures: [],
+      drainedRunIds: [],
+      drainFailures: [],
+    });
     expect(settleExplicitContinuationRetry).toHaveBeenCalledTimes(withSettler ? 1 : 0);
     if (withSettler) expect(settleExplicitContinuationRetry).toHaveBeenCalledWith(expect.objectContaining({
       id: runningRunId, status: "timed_out",
@@ -353,8 +361,16 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // agent.task_run event for the run it just terminalized. The write
     // never awaits the emission, so wait for it here instead of asserting
     // it fired synchronously.
+    // The backstop now also finalizes the agent, exactly as the graceful
+    // shutdown does, so an agent that never heartbeated emits its own
+    // `agent.first_heartbeat` beside the run's `agent.task_run`. Assert the run
+    // event itself rather than a total call count: the count was an
+    // implementation detail, and the second event is correct behaviour.
     await vi.waitFor(() => {
-      expect(mockTelemetryClient.track).toHaveBeenCalledTimes(1);
+      expect(mockTelemetryClient.track).toHaveBeenCalledWith(
+        "agent.task_run",
+        expect.objectContaining({ agent_id: agentId }),
+      );
     });
     expect(mockTelemetryClient.track).toHaveBeenCalledWith(
       "agent.task_run",
@@ -375,7 +391,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       assigneeAgentId: agentId, executionRunId: runningRunId, checkoutRunId: runningRunId,
     });
     const result = await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
-    expect(result).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+    expect(result).toEqual({
+      cleared: 0, issueIds: [], terminalizedRunIds: [], drainedRunIds: [], drainFailures: [],
+      releasedLeaseRunIds: [], leaseReleaseFailures: [],
+    });
     expect(await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runningRunId))).toEqual([{ status: "running" }]);
     expect(await db.select({ executionRunId: issues.executionRunId }).from(issues)
@@ -404,7 +423,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         }).where(eq(heartbeatRuns.id, runningRunId));
       },
     }).sweepStaleIssueLocks();
-    expect(result).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+    expect(result).toEqual({
+      cleared: 0, issueIds: [], terminalizedRunIds: [], drainedRunIds: [], drainFailures: [],
+      releasedLeaseRunIds: [], leaseReleaseFailures: [],
+    });
     expect(await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runningRunId))).toEqual([{ status: "running" }]);
     expect(mockTelemetryClient.track).not.toHaveBeenCalled();
@@ -444,7 +466,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
 
     const result = await heartbeatService(db).sweepStaleIssueLocks();
 
-    expect(result).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+    expect(result).toEqual({
+      cleared: 0, issueIds: [], terminalizedRunIds: [], drainedRunIds: [], drainFailures: [],
+      releasedLeaseRunIds: [], leaseReleaseFailures: [],
+    });
     await expect(db.select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runningRunId)))
@@ -495,7 +520,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     "preserves a completed native result in %s after its provider exits", async phase => {
       const { runningRunId, issueId } = await seedPendingNativeResult(phase);
       const result = await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
-      expect(result).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+      expect(result).toEqual({
+        cleared: 0, issueIds: [], terminalizedRunIds: [], drainedRunIds: [], drainFailures: [],
+        releasedLeaseRunIds: [], leaseReleaseFailures: [],
+      });
       expect(await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode }).from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runningRunId))).toEqual([{ status: "running", errorCode: null }]);
       expect(await db.select({ executionRunId: issues.executionRunId }).from(issues)
@@ -561,6 +589,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       cleared: 0,
       issueIds: [],
       terminalizedRunIds: [],
+      drainedRunIds: [],
+      drainFailures: [],
+      releasedLeaseRunIds: [],
+      leaseReleaseFailures: [],
     });
     await expect(db.select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
@@ -630,7 +662,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // The terminal write never awaits the telemetry emission, so wait for
     // it here instead of asserting it fired synchronously.
     await vi.waitFor(() => {
-      expect(mockTelemetryClient.track).toHaveBeenCalledTimes(1);
+      expect(mockTelemetryClient.track).toHaveBeenCalledWith(
+        "agent.task_run",
+        expect.objectContaining({ agent_id: agentId }),
+      );
     });
     expect(mockTelemetryClient.track).toHaveBeenCalledWith(
       "agent.task_run",
@@ -672,7 +707,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // The terminal write never awaits the telemetry emission, so wait for
     // it here instead of asserting it fired synchronously.
     await vi.waitFor(() => {
-      expect(mockTelemetryClient.track).toHaveBeenCalledTimes(1);
+      expect(mockTelemetryClient.track).toHaveBeenCalledWith(
+        "agent.task_run",
+        expect.objectContaining({ agent_id: agentId }),
+      );
     });
     expect(mockTelemetryClient.track).toHaveBeenCalledWith(
       "agent.task_run",
@@ -774,6 +812,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       cleared: 0,
       issueIds: [],
       terminalizedRunIds: [],
+      drainedRunIds: [],
+      drainFailures: [],
+      releasedLeaseRunIds: [],
+      leaseReleaseFailures: [],
     });
     await expect(
       db

@@ -17,6 +17,7 @@ import {
   asc,
   desc,
   eq,
+  exists,
   gt,
   getTableColumns,
   gte,
@@ -4541,6 +4542,15 @@ async function listIssueReviewAttentionMap(
         createdAt: agentWakeupRequests.requestedAt,
       })
       .from(agentWakeupRequests)
+      .innerJoin(issues, and(
+        eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = coalesce(
+          ${agentWakeupRequests.payload} ->> 'issueId',
+          ${agentWakeupRequests.payload} ->> 'taskId',
+          ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId',
+          ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId'
+        )`,
+      ))
       .where(
         and(
           eq(agentWakeupRequests.companyId, companyId),
@@ -4557,6 +4567,21 @@ async function listIssueReviewAttentionMap(
           ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId'
         )`,
             reviewIds,
+          ),
+          // A deferred or claimed wake is only a maintained action path while
+          // the issue is still held by a live run that will drain it. With the
+          // lock gone the row is parked with nothing to promote it, and
+          // counting it made an `in_review` issue report `covered` on orphan
+          // rows alone — which is what kept the review-path recovery from ever
+          // firing. A `queued` wake has not parked: it is awaiting ordinary
+          // dispatch, so it stays a path.
+          or(
+            eq(agentWakeupRequests.status, "queued"),
+            exists(dbOrTx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, companyId),
+              eq(heartbeatRuns.id, issues.executionRunId),
+              notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+            ))),
           ),
         ),
       ),

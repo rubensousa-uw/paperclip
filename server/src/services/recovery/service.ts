@@ -928,6 +928,34 @@ export function recoveryService(
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    // Re-enters the release admission for a run whose issue lock the sweep
+    // cleared, so the deferred-wake queue for that issue is drained instead of
+    // being orphaned. Without this the sweep's raw `UPDATE` is the only exit:
+    // the queue loses its only drain and every later wake for the issue parks
+    // forever. `releaseIssueExecutionAndPromote` in the heartbeat service.
+    releaseClearedIssueExecution?: (input: {
+      companyId: string;
+      runId: string;
+      issueId: string;
+    }) => Promise<void>;
+    // Releases the environment lease of a run the sweep just terminalized.
+    // `releaseEnvironmentLeasesForRun` in the heartbeat service — the same
+    // native release every other finalization path performs before it releases
+    // the issue lock.
+    releaseTerminalizedRunLeases?: (input: {
+      runId: string;
+      companyId: string;
+      agentId: string;
+      status: string;
+      failureReason?: string | null;
+    }) => Promise<void>;
+    // Native agent finalization after an orphan reaches terminal status.
+    // Keeps the agent running while another of its runs is alive.
+    finalizeTerminalizedRunAgentStatus?: (input: {
+      agentId: string;
+      outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
+      failureReason?: string | null;
+    }) => Promise<void>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -6092,6 +6120,28 @@ export function recoveryService(
       },
       "terminalized orphaned running heartbeat run in stale-lock sweep",
     );
+
+    // #14752: the shutdown finalizes the agent; the backstop used to leave it
+    // in `running`, which strands a `maxConcurrentRuns: 1` agent. Same optional
+    // seam, same best-effort contract.
+    try {
+      await deps.finalizeTerminalizedRunAgentStatus?.({
+        agentId: updated.agentId,
+        outcome: updated.status as
+          | "succeeded"
+          | "interrupted"
+          | "failed"
+          | "cancelled"
+          | "timed_out",
+        failureReason: updated.error ?? undefined,
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error, runId: updated.id, agentId: updated.agentId },
+        "recovery backstop terminalized an orphaned run but could not finalize its agent status",
+      );
+    }
+
     return { terminalized: true, status: updated.status };
   }
 
@@ -6108,6 +6158,10 @@ export function recoveryService(
       cleared: 0,
       issueIds: [] as string[],
       terminalizedRunIds: [] as string[],
+      drainedRunIds: [] as string[],
+      drainFailures: [] as string[],
+      releasedLeaseRunIds: [] as string[],
+      leaseReleaseFailures: [] as string[],
     };
 
     const candidates = await db
@@ -6191,6 +6245,36 @@ export function recoveryService(
       });
       runStatusById.set(row.id, outcome.status);
       if (outcome.terminalized) result.terminalizedRunIds.push(row.id);
+
+      // An orphaned run keeps its environment lease, and that lease is itself an
+      // execution blocker: `getConversationOwnershipBlocker` reports
+      // `execution_owner_active` with `recoveryActionId: null` while a lease row
+      // is unreleased, which `getExecutionBlocker` returns ahead of any
+      // `issueRecoveryActions` row. Every other finalization path releases the
+      // lease before releasing the issue (`releaseEnvironmentLeasesForRun` in
+      // `scanSilentActiveRuns` and in the process-loss finalizer); the sweep
+      // released neither, so the run it just terminalized went on blocking its
+      // own issue and the deferred queue for that issue had nothing to drain
+      // into. Release it here, before the lock clear below, which is the order
+      // the other paths use.
+      if (outcome.terminalized) {
+        try {
+          await deps.releaseTerminalizedRunLeases?.({
+            runId: row.id,
+            companyId: row.companyId,
+            agentId: row.agentId,
+            status: outcome.status,
+            failureReason: row.error ?? undefined,
+          });
+          result.releasedLeaseRunIds.push(row.id);
+        } catch (error) {
+          result.leaseReleaseFailures.push(row.id);
+          logger.warn(
+            { err: error, runId: row.id },
+            "stale-lock sweep terminalized an orphaned run but could not release its environment lease",
+          );
+        }
+      }
     }
 
     const isCleanable = (runId: string | null) => {
@@ -6264,14 +6348,59 @@ export function recoveryService(
           referencedRunStatuses: Object.fromEntries(runStatusById),
         },
       });
+
+      // Hand the issue back to the deferred-wake drain. The raw `UPDATE` above
+      // released the lock without ever entering `releaseIssueExecutionAndPromote`,
+      // so any wake already parked on `deferred_issue_execution` for this issue
+      // had no remaining route to promotion: its only drain runs from that
+      // function. Re-entering it here closes the recurrence the sweep creates.
+      //
+      // `executionRunId` is the lock the drain's own admission serializes on,
+      // and `checkoutRunId` is the second column the release transaction
+      // clears. A cleared candidate may carry either, so try each run id whose
+      // row exists; the release is idempotent and the second call is a no-op
+      // once the lock columns are already null.
+      for (const runId of [issue.executionRunId, issue.checkoutRunId]) {
+        if (!runId || result.drainedRunIds.includes(runId)) continue;
+        // A missing run row has no context to re-enter the drain with. The
+        // lock is already cleared, so there is nothing further this sweep can
+        // do for that candidate.
+        if (!runStatusById.has(runId)) continue;
+        // Without the dependency there is no drain to re-enter, so the caller
+        // keeps the previous self-heal behaviour. Optional chaining alone would
+        // record that as a successful drain, which is not what happened.
+        const release = deps.releaseClearedIssueExecution;
+        if (!release) continue;
+        try {
+          await release({ companyId: issue.companyId, runId, issueId: issue.id });
+          result.drainedRunIds.push(runId);
+        } catch (error) {
+          // A failed drain must not abort the sweep: the lock is already
+          // cleared, and the stranded queue is still recoverable by the next
+          // pass or by `strandedQueues` in `resumeQueuedRuns`.
+          result.drainFailures.push(runId);
+          logger.warn(
+            { err: error, runId, issueId: issue.id },
+            "stale-lock sweep cleared the issue lock but could not re-enter the deferred-wake drain",
+          );
+        }
+      }
     }
 
-    if (result.cleared > 0 || result.terminalizedRunIds.length > 0) {
+    if (
+      result.cleared > 0 ||
+      result.terminalizedRunIds.length > 0 ||
+      result.drainedRunIds.length > 0
+    ) {
       logger.warn(
         {
           cleared: result.cleared,
           issueIds: result.issueIds,
           terminalizedRunIds: result.terminalizedRunIds,
+          releasedLeaseRunIds: result.releasedLeaseRunIds,
+          leaseReleaseFailures: result.leaseReleaseFailures,
+          drainedRunIds: result.drainedRunIds,
+          drainFailures: result.drainFailures,
         },
         "swept stale issue lock columns",
       );
