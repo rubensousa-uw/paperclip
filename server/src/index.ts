@@ -698,7 +698,7 @@ async function startServerWithDatabaseTeardown(
   let resolveSessionFromHeaders:
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
-  let onSsoSettingsChanged: ((providers: import("@paperclipai/shared").SsoProviderConfig[]) => void) | undefined;
+  let onSsoSettingsChanged: ((providers: import("@paperclipai/shared").SsoProviderConfig[]) => Promise<void>) | undefined;
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
@@ -766,7 +766,7 @@ async function startServerWithDatabaseTeardown(
         "SSO providers configured",
       );
     }
-    const authManager = createBetterAuthManager(db as any, config, effectiveTrustedOrigins);
+    const authManager = await createBetterAuthManager(db as any, config, effectiveTrustedOrigins);
     betterAuthHandler = authManager.handler;
     resolveSession = (req) => authManager.resolveSession(req);
     resolveSessionFromHeaders = (headers) => authManager.resolveSessionFromHeaders(headers);

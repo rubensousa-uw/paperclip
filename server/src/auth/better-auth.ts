@@ -58,7 +58,9 @@ type BetterAuthSessionResolver = {
   api?: BetterAuthGetSessionApi;
 };
 
-type BetterAuthInstance = BetterAuthHandlerTarget & BetterAuthSessionResolver;
+type BetterAuthInstance = BetterAuthHandlerTarget & BetterAuthSessionResolver & {
+  $context?: Promise<unknown>;
+};
 
 const AUTH_COOKIE_PREFIX_FALLBACK = "default";
 const AUTH_COOKIE_PREFIX_INVALID_SEGMENTS_RE = /[^a-zA-Z0-9_-]+/g;
@@ -580,6 +582,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
   };
 
   return {
+    $context: Promise.all([defaultAuth.$context, loopbackAuth.$context]).then(() => undefined),
     handler: (request) => {
       const auth = shouldDisableSecureAuthCookies({
         ...cookieSecurityInput,
@@ -608,29 +611,61 @@ export function createBetterAuthHandler(auth: BetterAuthHandlerTarget): RequestH
 
 export interface BetterAuthManager {
   handler: RequestHandler;
+  fetch: (request: Request) => Promise<Response>;
   resolveSession: (req: Request) => Promise<BetterAuthSessionResult | null>;
   resolveSessionFromHeaders: (headers: Headers) => Promise<BetterAuthSessionResult | null>;
-  rebuild: (ssoProviders: SsoProviderConfig[]) => void;
+  rebuild: (ssoProviders: SsoProviderConfig[]) => Promise<void>;
 }
 
-export function createBetterAuthManager(
+async function createReadyBetterAuthInstance(
   db: Db,
   config: Config,
   trustedOrigins: string[],
-): BetterAuthManager {
-  let currentAuth = createBetterAuthInstance(db, config, trustedOrigins);
+): Promise<BetterAuthInstance> {
+  let providers = [...config.ssoProviders];
+  while (true) {
+    const auth = createBetterAuthInstance(db, { ...config, ssoProviders: providers }, trustedOrigins);
+    try {
+      // genericOAuth performs discovery from its async plugin init. Await it
+      // before the server considers auth ready so a rejected init cannot escape
+      // as an unhandled promise rejection after the listener starts.
+      await auth.$context;
+      return auth;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const match = /Provider "([^"]+)": discovery (?:returned no valid data|did not return an issuer)/.exec(message);
+      const failedProviderId = match?.[1];
+      if (!failedProviderId || !providers.some((provider) => provider.providerId === failedProviderId)) {
+        throw error;
+      }
+      logger.warn(
+        { providerId: failedProviderId },
+        "SSO provider disabled because OIDC discovery failed",
+      );
+      providers = providers.filter((provider) => provider.providerId !== failedProviderId);
+    }
+  }
+}
+
+export async function createBetterAuthManager(
+  db: Db,
+  config: Config,
+  trustedOrigins: string[],
+): Promise<BetterAuthManager> {
+  let currentAuth = await createReadyBetterAuthInstance(db, config, trustedOrigins);
   let currentHandler = toNodeHandler(currentAuth);
 
   const manager: BetterAuthManager = {
     handler: (req, res, next) => {
       void Promise.resolve(currentHandler(req, res)).catch(next);
     },
+    fetch: (request) => currentAuth.handler(request),
     resolveSession: (req) => resolveBetterAuthSession(currentAuth, req),
     resolveSessionFromHeaders: (headers) =>
       resolveBetterAuthSessionFromHeaders(currentAuth, headers),
-    rebuild: (ssoProviders) => {
+    rebuild: async (ssoProviders) => {
       const updatedConfig = { ...config, ssoProviders };
-      currentAuth = createBetterAuthInstance(db, updatedConfig, trustedOrigins);
+      currentAuth = await createReadyBetterAuthInstance(db, updatedConfig, trustedOrigins);
       currentHandler = toNodeHandler(currentAuth);
       logger.info(
         { providers: ssoProviders.map((p) => p.providerId) },

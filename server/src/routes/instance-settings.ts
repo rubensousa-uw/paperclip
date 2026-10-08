@@ -121,7 +121,7 @@ function withTaskDrainTransition<T>(run: () => Promise<T>): Promise<T> {
 
 export function instanceSettingsRoutes(
   db: Db,
-  opts?: { onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void },
+  opts?: { onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void | Promise<void> },
 ) {
   const router = Router();
   const svc = instanceSettingsService(db);
@@ -499,7 +499,7 @@ export function instanceSettingsRoutes(
       const updated = await svc.updateSso(req.body);
 
       const activeProviders = updated.sso.enabled ? updated.sso.providers : [];
-      opts?.onSsoSettingsChanged?.(activeProviders);
+      await opts?.onSsoSettingsChanged?.(activeProviders);
 
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();
