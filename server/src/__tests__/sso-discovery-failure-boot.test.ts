@@ -1,4 +1,7 @@
+import { createServer, type RequestListener } from "node:http";
+import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
+import { genericOAuth } from "better-auth/plugins";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SsoProviderConfig } from "@paperclipai/shared";
 import { createBetterAuthManager, SSO_DISCOVERY_BOOT_TIMEOUT_MS } from "../auth/better-auth.js";
@@ -47,10 +50,41 @@ function signIn(manager: Awaited<ReturnType<typeof createBetterAuthManager>>, pr
   }));
 }
 
+async function localIdp(listener: RequestListener) {
+  const server = createServer(listener);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Expected a local TCP listener");
+  return {
+    origin: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => {
+      server.closeAllConnections();
+      server.close((error) => error ? reject(error) : resolve());
+    }),
+  };
+}
+
+function shortDiscoveryTimeout() {
+  // Keep the production 10 s option, but shorten its real abort signal so the
+  // tests finish quickly. The readiness guard remains a separate, later limit.
+  const timeout = AbortSignal.timeout;
+  return vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => timeout(Math.min(ms, 100)));
+}
+
+function authTestEnvironment() {
+  vi.stubEnv("BETTER_AUTH_SECRET", "better-auth-test-secret-that-is-long-enough");
+  vi.stubEnv("PAPERCLIP_PUBLIC_URL", ORIGIN);
+  vi.stubEnv("PAPERCLIP_AUTH_RATE_LIMIT_ENABLED", "false");
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 describe("OIDC discovery failures during Better Auth startup", () => {
@@ -158,7 +192,7 @@ describe("OIDC discovery failures during Better Auth startup", () => {
     expect(await response.text()).toContain("INVITE_REQUIRED");
   });
 
-  it("times out a hanging discovery at boot, drops the provider, and logs once", async () => {
+  it("drops all SSO providers when the last-resort readiness guard times out and keeps password auth", async () => {
     vi.stubEnv("BETTER_AUTH_SECRET", "better-auth-test-secret-that-is-long-enough");
     vi.stubEnv("PAPERCLIP_PUBLIC_URL", ORIGIN);
     vi.stubEnv("PAPERCLIP_AUTH_RATE_LIMIT_ENABLED", "false");
@@ -176,9 +210,163 @@ describe("OIDC discovery failures during Better Auth startup", () => {
       body: JSON.stringify({ email: "nobody@example.com", password: "not-a-password" }),
     }));
     expect(passwordAuth.status).toBe(401);
-    expect((await signIn(manager, healthy.providerId)).status).toBe(200);
-    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    expect(logger.warn).toHaveBeenCalledWith({ providerId: healthy.providerId }, "SSO provider disabled because OIDC discovery failed");
     expect(logger.warn).toHaveBeenCalledWith({ providerId: hanging.providerId }, "SSO provider disabled because OIDC discovery failed");
+  });
+
+  it("handles two providers sharing one discovery URL independently when the second request hangs", async () => {
+    authTestEnvironment();
+    const timeout = shortDiscoveryTimeout();
+    let requests = 0;
+    let aborted = false;
+    const fetchMock = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      requests += 1;
+      if (requests === 2) {
+        const signal = init!.signal!;
+        return new Promise<Response>((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            reject(signal.reason);
+          }, { once: true });
+        });
+      }
+      return Promise.resolve(discoveryResponse());
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const healthy = { ...PROVIDER, providerId: "shared-healthy" };
+    const hanging = { ...PROVIDER, providerId: "shared-hanging" };
+    const manager = await createBetterAuthManager({} as never, config([healthy, hanging]), [ORIGIN], { discoveryTimeoutMs: 1_500 });
+
+    expect(aborted).toBe(true);
+    // Healthy discovery is repeated after the failed provider is removed.
+    expect(requests).toBe(3);
+    expect(timeout).toHaveBeenCalledWith(SSO_DISCOVERY_BOOT_TIMEOUT_MS);
+    const [url, request] = fetchMock.mock.calls[1]!;
+    expect(String(url)).toBe(DISCOVERY_URL);
+    expect((request as RequestInit & { timeout: number }).timeout).toBe(SSO_DISCOVERY_BOOT_TIMEOUT_MS);
+    expect(request!.signal!.aborted).toBe(true);
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+      { providerId: hanging.providerId }, "SSO provider disabled because OIDC discovery failed",
+    );
+    expect((await signIn(manager, healthy.providerId)).status).toBe(200);
+  });
+
+  it("aborts a hanging discovery body and drops only that provider", async () => {
+    authTestEnvironment();
+    shortDiscoveryTimeout();
+    let aborted = false;
+    let sentHeaders = false;
+    const idp = await localIdp((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/hanging-body") {
+        res.on("close", () => { aborted = !res.writableEnded; });
+        res.flushHeaders();
+        res.write('{"issuer":');
+        sentHeaders = true;
+        return;
+      }
+      res.end(JSON.stringify({
+        issuer: idp.origin,
+        authorization_endpoint: `${idp.origin}/authorize`,
+        token_endpoint: `${idp.origin}/token`,
+      }));
+    });
+    try {
+      const hanging = { ...PROVIDER, discoveryUrl: `${idp.origin}/hanging-body` };
+      const healthy = { ...PROVIDER, providerId: "healthy-idp", discoveryUrl: `${idp.origin}/discovery` };
+      const manager = await createBetterAuthManager({} as never, config([hanging, healthy]), [ORIGIN], { discoveryTimeoutMs: 1_500 });
+
+      expect(sentHeaders).toBe(true);
+      // Readiness fallback alone leaves this socket open. This assertion proves
+      // cancellation of the body read through the real patched package path.
+      await vi.waitFor(() => expect(aborted).toBe(true));
+      expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+        { providerId: hanging.providerId }, "SSO provider disabled because OIDC discovery failed",
+      );
+      expect((await signIn(manager, healthy.providerId)).status).toBe(200);
+    } finally {
+      await idp.close();
+    }
+  });
+
+  it("bounds a hanging JWKS fetch with the configured jose timeoutDuration", async () => {
+    authTestEnvironment();
+    let jwksRequested = false;
+    let aborted = false;
+    vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/jwks")) {
+        jwksRequested = true;
+        const signal = init!.signal!;
+        return new Promise<Response>((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            reject(signal.reason);
+          }, { once: true });
+        });
+      }
+      return Promise.resolve(discoveryResponse());
+    }));
+    const auth = betterAuth({
+      baseURL: ORIGIN,
+      secret: process.env.BETTER_AUTH_SECRET,
+      database: memoryAdapter({ user: [], session: [], account: [], verification: [] }),
+      plugins: [genericOAuth({ config: [{
+        providerId: PROVIDER.providerId,
+        clientId: PROVIDER.clientId,
+        clientSecret: PROVIDER.clientSecret,
+        discoveryUrl: DISCOVERY_URL,
+        discoveryFetchOptions: { timeout: 100 },
+      }] })],
+    });
+    const ctx = await auth.$context;
+    const provider = ctx.socialProviders.find((p) => p.id === PROVIDER.providerId)!;
+    // JWKS fetching is lazy. Exercise the resolver that the real plugin
+    // installed for ID-token verification. Only the HTTP transport is mocked.
+    expect(jwksRequested).toBe(false);
+    expect(provider.idToken).toMatchObject({
+      issuer: "https://idp.example.com", audience: PROVIDER.clientId, algorithms: ["RS256"],
+    });
+    expect(provider.requiresIdTokenNonce).toBe(true);
+    const started = performance.now();
+    await expect(provider.idToken!.jwks({ alg: "RS256", kid: "test-key" }, {
+      payload: "", protected: "", signature: "",
+    })).rejects.toMatchObject({ name: "JWKSTimeout", code: "ERR_JWKS_TIMEOUT" });
+    expect(performance.now() - started).toBeLessThan(1_500);
+    expect(jwksRequested).toBe(true);
+    expect(aborted).toBe(true);
+  }, 2_000);
+
+  it("aborts a hanging discovery body through a signal-aware stream transport", async () => {
+    authTestEnvironment();
+    shortDiscoveryTimeout();
+    let aborted = false;
+    vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes("healthy.example.com")) return Promise.resolve(discoveryResponse());
+      const signal = init!.signal!;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"issuer":'));
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            controller.error(signal.reason);
+          }, { once: true });
+        },
+      });
+      return Promise.resolve(new Response(body, { headers: { "content-type": "application/json" } }));
+    }));
+    const healthy = { ...PROVIDER, providerId: "healthy-idp", discoveryUrl: "https://healthy.example.com/discovery" };
+    const manager = await createBetterAuthManager({} as never, config([PROVIDER, healthy]), [ORIGIN], { discoveryTimeoutMs: 1_500 });
+
+    // Supplemental body-consumption proof for environments that prohibit
+    // loopback listeners. The local node:http regression above remains required.
+    expect(aborted).toBe(true);
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+      { providerId: PROVIDER.providerId }, "SSO provider disabled because OIDC discovery failed",
+    );
+    expect((await signIn(manager, healthy.providerId)).status).toBe(200);
   });
 
   it("discards an older enable rebuild that resolves after a newer disable rebuild", async () => {

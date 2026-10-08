@@ -326,6 +326,7 @@ function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthC
   }
 
   baseConfig.disableImplicitSignUp = true;
+  baseConfig.discoveryFetchOptions = { timeout: SSO_DISCOVERY_BOOT_TIMEOUT_MS };
   return withRoleRestrictedUserInfo(baseConfig, provider);
 }
 
@@ -626,54 +627,15 @@ export interface BetterAuthManagerOptions {
   now?: () => number;
 }
 
-type DiscoveryTracker = {
-  providerIdsByUrl: Map<string, string[]>;
-  pendingProviderIds: Set<string>;
-};
+class SsoDiscoveryReadinessTimeout extends Error {}
 
-const activeDiscoveryTrackers = new Set<DiscoveryTracker>();
-let originalDiscoveryFetch: typeof fetch | null = null;
-let trackedDiscoveryFetch: typeof fetch | null = null;
-
-function trackDiscoveryFetches(providers: SsoProviderConfig[]): {
-  pendingProviderIds: () => string[];
-  stop: () => void;
-} {
-  const providerIdsByUrl = new Map<string, string[]>();
-  for (const provider of providers) {
-    const discoveryUrl = provider.discoveryUrl;
-    if (!discoveryUrl) continue;
-    const providerIds = providerIdsByUrl.get(discoveryUrl) ?? [];
-    providerIds.push(provider.providerId);
-    providerIdsByUrl.set(discoveryUrl, providerIds);
-  }
-  const tracker: DiscoveryTracker = { providerIdsByUrl, pendingProviderIds: new Set() };
-  if (!trackedDiscoveryFetch) {
-    originalDiscoveryFetch = globalThis.fetch;
-    const fetchToWrap = originalDiscoveryFetch;
-    trackedDiscoveryFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = input instanceof Request ? input.url : String(input);
-      const tracked = [...activeDiscoveryTrackers]
-        .flatMap((active) => active.providerIdsByUrl.get(url)?.map((providerId) => ({ active, providerId })) ?? []);
-      for (const { active, providerId } of tracked) active.pendingProviderIds.add(providerId);
-      return fetchToWrap(input, init).finally(() => {
-        for (const { active, providerId } of tracked) active.pendingProviderIds.delete(providerId);
-      });
-    }) as typeof fetch;
-    globalThis.fetch = trackedDiscoveryFetch;
-  }
-  activeDiscoveryTrackers.add(tracker);
-  return {
-    pendingProviderIds: () => [...tracker.pendingProviderIds],
-    stop: () => {
-      activeDiscoveryTrackers.delete(tracker);
-      if (activeDiscoveryTrackers.size === 0 && globalThis.fetch === trackedDiscoveryFetch) {
-        globalThis.fetch = originalDiscoveryFetch ?? globalThis.fetch;
-        originalDiscoveryFetch = null;
-        trackedDiscoveryFetch = null;
-      }
-    },
-  };
+function isDiscoveryTimeout(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { name, code } = error as { name?: unknown; code?: unknown };
+  // better-fetch propagates the fetch signal's DOMException; jose wraps its
+  // remote JWKS timeout in JWKSTimeout. Match identities, not error messages.
+  return name === "TimeoutError" || name === "AbortError" ||
+    name === "JWKSTimeout" || code === "ERR_JWKS_TIMEOUT";
 }
 
 function isDiscoveryFailure(error: unknown): string | null {
@@ -690,15 +652,7 @@ async function createReadyBetterAuthInstance(
   let providers = [...config.ssoProviders];
   const originalProviderIds = new Set(providers.map((provider) => provider.providerId));
   while (true) {
-    const discoveryTracker = trackDiscoveryFetches(providers);
-    let auth: BetterAuthInstance;
-    try {
-      auth = createBetterAuthInstance(db, { ...config, ssoProviders: providers }, trustedOrigins);
-    } catch (error) {
-      discoveryTracker.stop();
-      throw error;
-    }
-    let timedOutProviderIds: string[] = [];
+    const auth = createBetterAuthInstance(db, { ...config, ssoProviders: providers }, trustedOrigins);
     try {
       // genericOAuth performs discovery from its async plugin init. Await it
       // before the server considers auth ready so a rejected init cannot escape
@@ -709,14 +663,12 @@ async function createReadyBetterAuthInstance(
           auth.$context,
           new Promise<never>((_, reject) => {
             timeout = setTimeout(() => {
-              timedOutProviderIds = discoveryTracker.pendingProviderIds();
-              reject(new Error("SSO discovery readiness timed out"));
+              reject(new SsoDiscoveryReadinessTimeout("SSO discovery readiness timed out"));
             }, timeoutMs);
           }),
         ]);
       } finally {
         if (timeout) clearTimeout(timeout);
-        discoveryTracker.stop();
       }
       auth.$paperclipSsoProviderIds = [...providers]
         .filter((provider) => originalProviderIds.has(provider.providerId))
@@ -726,8 +678,11 @@ async function createReadyBetterAuthInstance(
       const failedProviderId = isDiscoveryFailure(error);
       const failedProviderIds = failedProviderId
         ? [failedProviderId]
-        : error instanceof Error && error.message === "SSO discovery readiness timed out"
-          ? timedOutProviderIds
+        // Normally genericOAuth attributes discovery failures to a provider.
+        // This guard (or an unattributed fetch/JWKS timeout) cannot identify one
+        // provider, so rebuild with password auth and no SSO providers.
+        : error instanceof SsoDiscoveryReadinessTimeout || isDiscoveryTimeout(error)
+          ? providers.map((provider) => provider.providerId)
           : [];
       const droppedProviderIds = failedProviderIds.filter((providerId) =>
         providers.some((provider) => provider.providerId === providerId),
