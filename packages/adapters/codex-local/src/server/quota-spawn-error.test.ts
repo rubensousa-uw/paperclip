@@ -72,6 +72,7 @@ describe("CodexRpcClient spawn failures", () => {
 
     const result = await getQuotaWindows();
 
+    expect(mockSpawn).toHaveBeenCalledWith("codex", ["-s", "read-only", "-a", "never", "app-server"], expect.objectContaining({ stdio: ["pipe", "pipe", "pipe"] }));
     expect(result.ok).toBe(false);
     expect(result.source).toBe("codex-rpc");
     expect(result.errorFamily).toBe("refresh_token_expired");

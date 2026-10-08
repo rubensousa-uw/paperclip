@@ -470,7 +470,7 @@ type PendingRequest = {
 class CodexRpcClient {
   private proc = spawn(
     "codex",
-    ["-s", "read-only", "-a", "untrusted", "app-server"],
+    ["-s", "read-only", "-a", "never", "app-server"],
     { stdio: ["pipe", "pipe", "pipe"], env: process.env },
   );
 
