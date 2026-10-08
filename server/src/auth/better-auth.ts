@@ -60,6 +60,7 @@ type BetterAuthSessionResolver = {
 
 type BetterAuthInstance = BetterAuthHandlerTarget & BetterAuthSessionResolver & {
   $context?: Promise<unknown>;
+  $paperclipSsoProviderIds?: string[];
 };
 
 const AUTH_COOKIE_PREFIX_FALLBACK = "default";
@@ -617,32 +618,133 @@ export interface BetterAuthManager {
   rebuild: (ssoProviders: SsoProviderConfig[]) => Promise<void>;
 }
 
+export const SSO_DISCOVERY_BOOT_TIMEOUT_MS = 10_000;
+const SSO_RECOVERY_COOLDOWN_MS = 60_000;
+
+export interface BetterAuthManagerOptions {
+  discoveryTimeoutMs?: number;
+  now?: () => number;
+}
+
+type DiscoveryTracker = {
+  providerIdsByUrl: Map<string, string[]>;
+  pendingProviderIds: Set<string>;
+};
+
+const activeDiscoveryTrackers = new Set<DiscoveryTracker>();
+let originalDiscoveryFetch: typeof fetch | null = null;
+let trackedDiscoveryFetch: typeof fetch | null = null;
+
+function trackDiscoveryFetches(providers: SsoProviderConfig[]): {
+  pendingProviderIds: () => string[];
+  stop: () => void;
+} {
+  const providerIdsByUrl = new Map<string, string[]>();
+  for (const provider of providers) {
+    const discoveryUrl = provider.discoveryUrl;
+    if (!discoveryUrl) continue;
+    const providerIds = providerIdsByUrl.get(discoveryUrl) ?? [];
+    providerIds.push(provider.providerId);
+    providerIdsByUrl.set(discoveryUrl, providerIds);
+  }
+  const tracker: DiscoveryTracker = { providerIdsByUrl, pendingProviderIds: new Set() };
+  if (!trackedDiscoveryFetch) {
+    originalDiscoveryFetch = globalThis.fetch;
+    const fetchToWrap = originalDiscoveryFetch;
+    trackedDiscoveryFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const tracked = [...activeDiscoveryTrackers]
+        .flatMap((active) => active.providerIdsByUrl.get(url)?.map((providerId) => ({ active, providerId })) ?? []);
+      for (const { active, providerId } of tracked) active.pendingProviderIds.add(providerId);
+      return fetchToWrap(input, init).finally(() => {
+        for (const { active, providerId } of tracked) active.pendingProviderIds.delete(providerId);
+      });
+    }) as typeof fetch;
+    globalThis.fetch = trackedDiscoveryFetch;
+  }
+  activeDiscoveryTrackers.add(tracker);
+  return {
+    pendingProviderIds: () => [...tracker.pendingProviderIds],
+    stop: () => {
+      activeDiscoveryTrackers.delete(tracker);
+      if (activeDiscoveryTrackers.size === 0 && globalThis.fetch === trackedDiscoveryFetch) {
+        globalThis.fetch = originalDiscoveryFetch ?? globalThis.fetch;
+        originalDiscoveryFetch = null;
+        trackedDiscoveryFetch = null;
+      }
+    },
+  };
+}
+
+function isDiscoveryFailure(error: unknown): string | null {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Provider "([^"]+)": discovery (?:returned no valid data|did not return an issuer)/.exec(message)?.[1] ?? null;
+}
+
 async function createReadyBetterAuthInstance(
   db: Db,
   config: Config,
   trustedOrigins: string[],
+  timeoutMs = SSO_DISCOVERY_BOOT_TIMEOUT_MS,
 ): Promise<BetterAuthInstance> {
   let providers = [...config.ssoProviders];
+  const originalProviderIds = new Set(providers.map((provider) => provider.providerId));
   while (true) {
-    const auth = createBetterAuthInstance(db, { ...config, ssoProviders: providers }, trustedOrigins);
+    const discoveryTracker = trackDiscoveryFetches(providers);
+    let auth: BetterAuthInstance;
+    try {
+      auth = createBetterAuthInstance(db, { ...config, ssoProviders: providers }, trustedOrigins);
+    } catch (error) {
+      discoveryTracker.stop();
+      throw error;
+    }
+    let timedOutProviderIds: string[] = [];
     try {
       // genericOAuth performs discovery from its async plugin init. Await it
       // before the server considers auth ready so a rejected init cannot escape
       // as an unhandled promise rejection after the listener starts.
-      await auth.$context;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          auth.$context,
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => {
+              timedOutProviderIds = discoveryTracker.pendingProviderIds();
+              reject(new Error("SSO discovery readiness timed out"));
+            }, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+        discoveryTracker.stop();
+      }
+      auth.$paperclipSsoProviderIds = [...providers]
+        .filter((provider) => originalProviderIds.has(provider.providerId))
+        .map((provider) => provider.providerId);
       return auth;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const match = /Provider "([^"]+)": discovery (?:returned no valid data|did not return an issuer)/.exec(message);
-      const failedProviderId = match?.[1];
-      if (!failedProviderId || !providers.some((provider) => provider.providerId === failedProviderId)) {
+      const failedProviderId = isDiscoveryFailure(error);
+      const failedProviderIds = failedProviderId
+        ? [failedProviderId]
+        : error instanceof Error && error.message === "SSO discovery readiness timed out"
+          ? timedOutProviderIds
+          : [];
+      const droppedProviderIds = failedProviderIds.filter((providerId) =>
+        providers.some((provider) => provider.providerId === providerId),
+      );
+      if (droppedProviderIds.length === 0) {
         throw error;
       }
-      logger.warn(
-        { providerId: failedProviderId },
-        "SSO provider disabled because OIDC discovery failed",
-      );
-      providers = providers.filter((provider) => provider.providerId !== failedProviderId);
+      for (const providerId of droppedProviderIds) {
+        logger.warn(
+          { providerId },
+          "SSO provider disabled because OIDC discovery failed",
+        );
+      }
+      providers = providers.filter((provider) => !droppedProviderIds.includes(provider.providerId));
+      // A timed out context may still reject after it is abandoned. Keep a
+      // rejection handler attached even though readiness has moved on.
+      void auth.$context?.catch(() => undefined);
     }
   }
 }
@@ -651,27 +753,90 @@ export async function createBetterAuthManager(
   db: Db,
   config: Config,
   trustedOrigins: string[],
+  options: BetterAuthManagerOptions = {},
 ): Promise<BetterAuthManager> {
-  let currentAuth = await createReadyBetterAuthInstance(db, config, trustedOrigins);
+  const timeoutMs = options.discoveryTimeoutMs ?? SSO_DISCOVERY_BOOT_TIMEOUT_MS;
+  const now = options.now ?? Date.now;
+  let configuredProviders = [...config.ssoProviders];
+  let installedProviders = [...config.ssoProviders];
+  let generation = 0;
+  let currentAuth = await createReadyBetterAuthInstance(db, config, trustedOrigins, timeoutMs);
+  installedProviders = config.ssoProviders.filter((provider) =>
+    currentAuth.$paperclipSsoProviderIds?.includes(provider.providerId),
+  );
   let currentHandler = toNodeHandler(currentAuth);
+  let recoveryPromise: Promise<void> | null = null;
+  let lastRecoveryAt = Number.NEGATIVE_INFINITY;
+
+  const rebuild = async (ssoProviders: SsoProviderConfig[]): Promise<void> => {
+    const rebuildGeneration = ++generation;
+    configuredProviders = [...ssoProviders];
+    const updatedConfig = { ...config, ssoProviders };
+    const readyAuth = await createReadyBetterAuthInstance(db, updatedConfig, trustedOrigins, timeoutMs);
+    if (rebuildGeneration !== generation) return;
+    currentAuth = readyAuth;
+    installedProviders = ssoProviders.filter((provider) =>
+      readyAuth.$paperclipSsoProviderIds?.includes(provider.providerId),
+    );
+    currentHandler = toNodeHandler(currentAuth);
+    logger.info(
+      { providers: ssoProviders.map((p) => p.providerId) },
+      "Better Auth instance rebuilt with updated SSO providers",
+    );
+  };
+
+  const recoverDroppedProvider = (): Promise<void> => {
+    if (recoveryPromise) return recoveryPromise;
+    if (now() - lastRecoveryAt < SSO_RECOVERY_COOLDOWN_MS) return Promise.resolve();
+    lastRecoveryAt = now();
+    const attempt = rebuild(configuredProviders);
+    recoveryPromise = attempt.finally(() => {
+      if (recoveryPromise === wrapped) recoveryPromise = null;
+    });
+    const wrapped = recoveryPromise;
+    return wrapped;
+  };
+
+  const providerFromBody = (body: unknown, path: string): string | null => {
+    if (!body || typeof body !== "object") return null;
+    const value = body as Record<string, unknown>;
+    const provider = path.endsWith("/sign-in/oauth2") ? value.providerId : value.provider;
+    return typeof provider === "string" ? provider : null;
+  };
+
+  const shouldRecover = async (providerId: string | null): Promise<boolean> => {
+    if (!providerId || !configuredProviders.some((provider) => provider.providerId === providerId) ||
+        installedProviders.some((provider) => provider.providerId === providerId)) return false;
+    await recoverDroppedProvider().catch(() => undefined);
+    return installedProviders.some((provider) => provider.providerId === providerId);
+  };
+
+  const handleFetch = async (request: Request): Promise<Response> => {
+    const url = new URL(request.url);
+    if (request.method === "POST" && /\/sign-in\/(?:oauth2|social)$/.test(url.pathname)) {
+      let body: unknown;
+      try { body = await request.clone().json(); } catch { /* Better Auth handles malformed input. */ }
+      await shouldRecover(providerFromBody(body, url.pathname));
+    }
+    return currentAuth.handler(request);
+  };
 
   const manager: BetterAuthManager = {
     handler: (req, res, next) => {
-      void Promise.resolve(currentHandler(req, res)).catch(next);
+      const path = req.url.split("?")[0] ?? "";
+      const providerId = req.method === "POST" && /\/sign-in\/(?:oauth2|social)$/.test(path)
+        ? providerFromBody(req.body, path)
+        : null;
+      void (async () => {
+        await shouldRecover(providerId);
+        await currentHandler(req, res);
+      })().catch(next);
     },
-    fetch: (request) => currentAuth.handler(request),
+    fetch: handleFetch,
     resolveSession: (req) => resolveBetterAuthSession(currentAuth, req),
     resolveSessionFromHeaders: (headers) =>
       resolveBetterAuthSessionFromHeaders(currentAuth, headers),
-    rebuild: async (ssoProviders) => {
-      const updatedConfig = { ...config, ssoProviders };
-      currentAuth = await createReadyBetterAuthInstance(db, updatedConfig, trustedOrigins);
-      currentHandler = toNodeHandler(currentAuth);
-      logger.info(
-        { providers: ssoProviders.map((p) => p.providerId) },
-        "Better Auth instance rebuilt with updated SSO providers",
-      );
-    },
+    rebuild,
   };
 
   return manager;
