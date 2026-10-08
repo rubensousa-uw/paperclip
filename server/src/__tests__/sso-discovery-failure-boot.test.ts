@@ -215,6 +215,40 @@ describe("OIDC discovery failures during Better Auth startup", () => {
     expect(logger.warn).toHaveBeenCalledWith({ providerId: hanging.providerId }, "SSO provider disabled because OIDC discovery failed");
   });
 
+  it("uses the later default readiness guard so a per-provider timeout drops only the hanging provider", async () => {
+    authTestEnvironment();
+    vi.useFakeTimers();
+    try {
+      const healthy = { ...PROVIDER, providerId: "healthy-idp", discoveryUrl: "https://healthy.example.com/.well-known/openid-configuration" };
+      const hanging = { ...PROVIDER, providerId: "hanging-idp", discoveryUrl: "https://hanging.example.com/.well-known/openid-configuration" };
+      const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.includes("healthy.example.com")) {
+          return Response.json({ ...await discoveryResponse().json(), issuer: "https://healthy.example.com" });
+        }
+        const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+        return new Promise<Response>((_resolve, reject) => {
+          if (!signal) throw new Error("Expected discovery fetch timeout signal");
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          if (signal.aborted) reject(signal.reason);
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      // No discoveryTimeoutMs override: use the production per-provider and readiness defaults.
+      const managerPromise = createBetterAuthManager({} as never, config([healthy, hanging]), [ORIGIN]);
+      await vi.advanceTimersByTimeAsync(SSO_DISCOVERY_BOOT_TIMEOUT_MS);
+      const manager = await managerPromise;
+
+      expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+        { providerId: hanging.providerId }, "SSO provider disabled because OIDC discovery failed",
+      );
+      expect((await signIn(manager, healthy.providerId)).status).toBe(200);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("handles two providers sharing one discovery URL independently when the second request hangs", async () => {
     authTestEnvironment();
     const timeout = shortDiscoveryTimeout();
