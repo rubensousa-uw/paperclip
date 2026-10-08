@@ -27,6 +27,7 @@ import {
   derivePaperclipViteHmrPort,
   type DeploymentExposure,
   type DeploymentMode,
+  type SsoProviderConfig,
 } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
@@ -493,6 +494,8 @@ export async function createApp(
     instanceId?: string;
     hostVersion?: string;
     localPluginDir?: string;
+    ssoProviders?: SsoProviderConfig[];
+    onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void;
     pluginMigrationDb?: Db;
     pluginWorkerManager?: PluginWorkerManager;
     decisionServiceOptions: DecisionServiceOptions;
@@ -600,6 +603,24 @@ export async function createApp(
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
   app.use("/api/auth", authRoutes(db));
+  const ssoSettingsSvc = instanceSettingsService(db);
+  app.get("/api/auth/sso-providers", async (_req, res) => {
+    const ssoSettings = await ssoSettingsSvc.getSso();
+    if (!ssoSettings.enabled) {
+      res.json({ providers: [] });
+      return;
+    }
+    const dbHasProviders = ssoSettings.providers.length > 0;
+    const activeProviders = dbHasProviders
+      ? ssoSettings.providers
+      : (opts.ssoProviders ?? []);
+    const providers = activeProviders.map((p) => ({
+      providerId: p.providerId,
+      displayName: p.displayName || p.type.replace(/_/g, " "),
+      type: p.type,
+    }));
+    res.json({ providers });
+  });
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
   }
@@ -823,7 +844,7 @@ export async function createApp(
   api.use(announcementRoutes(db, { ...opts.announcements, version: opts.hostVersion ?? serverVersion }));
   api.use(resourceMembershipRoutes(db));
   api.use(inboxDismissalRoutes(db));
-  api.use(instanceSettingsRoutes(db));
+  api.use(instanceSettingsRoutes(db, { onSsoSettingsChanged: opts.onSsoSettingsChanged }));
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }

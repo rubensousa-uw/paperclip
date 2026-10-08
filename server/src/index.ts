@@ -698,6 +698,7 @@ async function startServerWithDatabaseTeardown(
   let resolveSessionFromHeaders:
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
+  let onSsoSettingsChanged: ((providers: import("@paperclipai/shared").SsoProviderConfig[]) => void) | undefined;
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
@@ -716,12 +717,16 @@ async function startServerWithDatabaseTeardown(
   }
   if (config.deploymentMode === "authenticated") {
     const {
-      createBetterAuthHandler,
-      createBetterAuthInstance,
       deriveAuthTrustedOrigins,
-      resolveBetterAuthSession,
-      resolveBetterAuthSessionFromHeaders,
     } = await import("./auth/better-auth.js");
+    const { instanceSettingsService: createSsoSvc } = await import("./services/instance-settings.js");
+    const betterAuthSecret =
+      process.env.BETTER_AUTH_SECRET?.trim() ?? process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
+    if (!betterAuthSecret) {
+      throw new Error(
+        "authenticated mode requires BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET) to be set",
+      );
+    }
     const derivedTrustedOrigins = deriveAuthTrustedOrigins(config, { listenPort });
     const envTrustedOrigins = (process.env.BETTER_AUTH_TRUSTED_ORIGINS ?? "")
       .split(",")
@@ -740,10 +745,32 @@ async function startServerWithDatabaseTeardown(
       },
       "Authenticated mode auth origin configuration",
     );
-    const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
-    betterAuthHandler = createBetterAuthHandler(auth);
-    resolveSession = (req) => resolveBetterAuthSession(auth, req);
-    resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
+
+    const {
+      createBetterAuthManager,
+    } = await import("./auth/better-auth.js");
+    const ssoSvc = createSsoSvc(db as any);
+    const dbSsoSettings = await ssoSvc.getSso();
+    const initialSsoProviders = dbSsoSettings.enabled && dbSsoSettings.providers.length > 0
+      ? dbSsoSettings.providers
+      : config.ssoProviders;
+    config.ssoProviders = initialSsoProviders;
+
+    if (config.ssoProviders.length > 0) {
+      const publicBase = (config.authPublicBaseUrl ?? `http://localhost:${config.port}`).replace(/\/+$/, "");
+      logger.info(
+        {
+          providers: config.ssoProviders.map((p) => p.providerId),
+          callbackUrlPattern: `${publicBase}/api/auth/callback/{providerId}`,
+        },
+        "SSO providers configured",
+      );
+    }
+    const authManager = createBetterAuthManager(db as any, config, effectiveTrustedOrigins);
+    betterAuthHandler = authManager.handler;
+    resolveSession = (req) => authManager.resolveSession(req);
+    resolveSessionFromHeaders = (headers) => authManager.resolveSessionFromHeaders(headers);
+    onSsoSettingsChanged = (providers) => authManager.rebuild(providers);
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
     authReady = true;
   }
@@ -919,9 +946,11 @@ async function startServerWithDatabaseTeardown(
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
     announcements: { enabled: config.announcementsEnabled, feedUrl: config.announcementsFeedUrl },
+    ssoProviders: config.ssoProviders,
     pluginMigrationDb: pluginMigrationDb as any,
     betterAuthHandler,
     resolveSession,
+    onSsoSettingsChanged,
     pluginWorkerManager,
     decisionServiceOptions,
     managedPluginAutoInstall,

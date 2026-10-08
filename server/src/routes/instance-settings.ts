@@ -5,6 +5,8 @@ import {
   patchInstanceExperimentalSettingsSchema,
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
+  patchInstanceSsoSettingsSchema,
+  type SsoProviderConfig,
 } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import {
@@ -117,7 +119,10 @@ function withTaskDrainTransition<T>(run: () => Promise<T>): Promise<T> {
   return turn;
 }
 
-export function instanceSettingsRoutes(db: Db) {
+export function instanceSettingsRoutes(
+  db: Db,
+  opts?: { onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void },
+) {
   const router = Router();
   const svc = instanceSettingsService(db);
   const environments = environmentService(db);
@@ -480,6 +485,46 @@ export function instanceSettingsRoutes(db: Db) {
     const updated = await companySvc.update(primaryCompanyId, { status: "active" }, actor);
     res.json({ status: updated?.status ?? "active", changed: true });
   });
+
+  router.get("/instance/settings/sso", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    res.json(await svc.getSso());
+  });
+
+  router.patch(
+    "/instance/settings/sso",
+    validate(patchInstanceSsoSettingsSchema),
+    async (req, res) => {
+      assertCanManageInstanceSettings(req);
+      const updated = await svc.updateSso(req.body);
+
+      const activeProviders = updated.sso.enabled ? updated.sso.providers : [];
+      opts?.onSsoSettingsChanged?.(activeProviders);
+
+      const actor = getActorInfo(req);
+      const companyIds = await svc.listCompanyIds();
+      await Promise.all(
+        companyIds.map((companyId) =>
+          logActivity(db, {
+            companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "instance.settings.sso_updated",
+            entityType: "instance_settings",
+            entityId: updated.id,
+            details: {
+              sso: { enabled: updated.sso.enabled, providerCount: updated.sso.providers.length },
+              changedKeys: Object.keys(req.body).sort(),
+            },
+          }),
+        ),
+      );
+      res.json(updated.sso);
+    },
+  );
 
   return router;
 }

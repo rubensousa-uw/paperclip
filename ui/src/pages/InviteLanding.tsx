@@ -222,6 +222,7 @@ export function InviteLandingPage() {
   const [result, setResult] = useState<{ kind: "bootstrap" | "join"; payload: unknown } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [authFeedback, setAuthFeedback] = useState<AuthFeedback | null>(null);
+  const [ssoLoading, setSsoLoading] = useState<string | null>(null);
   const [autoAcceptStarted, setAutoAcceptStarted] = useState(false);
   const authErrorId = "invite-auth-error";
 
@@ -240,6 +241,11 @@ export function InviteLandingPage() {
     queryFn: () => accessApi.getInvite(token),
     enabled: token.length > 0,
     retry: false,
+  });
+  const { data: ssoProviders } = useQuery({
+    queryKey: ["auth", "sso-providers"],
+    queryFn: () => authApi.getSsoProviders(),
+    staleTime: 5 * 60 * 1000,
   });
 
   // Whose list this is, is no longer this page's problem: the entry is keyed by
@@ -426,6 +432,24 @@ export function InviteLandingPage() {
       setAuthFeedback(nextFeedback);
     },
   });
+
+  const handleSsoSignIn = async (providerId: string) => {
+    setSsoLoading(providerId);
+    setAuthFeedback(null);
+    try {
+      rememberPendingInviteToken(token);
+      const callbackURL = `${window.location.origin}/auth?next=${encodeURIComponent(`/invite/${token}`)}`;
+      const requestSignUp = true;
+      const redirectUrl = await authApi.signInSso(providerId, callbackURL, requestSignUp);
+      window.location.href = redirectUrl;
+    } catch (err) {
+      setAuthFeedback({
+        tone: "error",
+        message: err instanceof Error ? err.message : "SSO sign-in failed",
+      });
+      setSsoLoading(null);
+    }
+  };
 
   const joinButtonLabel = useMemo(() => {
     if (!invite) return "Continue";
@@ -675,6 +699,30 @@ export function InviteLandingPage() {
                       : "Use the Paperclip account that already matches this invite. If you do not have one yet, switch back to create account."}
                   </p>
                 </div>
+
+                {ssoProviders && ssoProviders.length > 0 ? (
+                  <div className="space-y-4">
+                    <div className="space-y-2">
+                      {ssoProviders.map((provider) => (
+                        <Button
+                          key={provider.providerId}
+                          type="button"
+                          variant="outline"
+                          className={`${fieldClassName} rounded-none hover:bg-accent hover:text-accent-foreground`}
+                          disabled={ssoLoading !== null || authMutation.isPending}
+                          onClick={() => handleSsoSignIn(provider.providerId)}
+                        >
+                          {ssoLoading === provider.providerId ? "Redirecting..." : provider.displayName}
+                        </Button>
+                      ))}
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                      <span className="flex-1 border-t border-border" />
+                      <span>or continue with email</span>
+                      <span className="flex-1 border-t border-border" />
+                    </div>
+                  </div>
+                ) : null}
 
                 <div className="flex gap-2">
                   <button

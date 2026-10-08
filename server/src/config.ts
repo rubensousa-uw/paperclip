@@ -13,11 +13,13 @@ import {
   DEPLOYMENT_EXPOSURES,
   SECRET_PROVIDERS,
   STORAGE_PROVIDERS,
+  ssoProviderConfigSchema,
   type BindMode,
   type AuthBaseUrlMode,
   type DeploymentExposure,
   type DeploymentMode,
   type SecretProvider,
+  type SsoProviderConfig,
   type StorageProvider,
   inferBindModeFromHost,
   resolveRuntimeBind,
@@ -66,6 +68,7 @@ export interface Config {
   authPublicBaseUrl: string | undefined;
   chatWebhookPublicBaseUrl: string | undefined;
   authDisableSignUp: boolean;
+  ssoProviders: SsoProviderConfig[];
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
   databaseMigrationUrl: string | undefined;
@@ -221,6 +224,26 @@ export function loadConfig(): Config {
     disableSignUpFromEnv !== undefined
       ? disableSignUpFromEnv === "true"
       : (fileConfig?.auth?.disableSignUp ?? false);
+
+  const ssoProviders: SsoProviderConfig[] = (() => {
+    const envRaw = process.env.PAPERCLIP_SSO_PROVIDERS?.trim();
+    if (envRaw) {
+      try {
+        const parsed = JSON.parse(envRaw);
+        const arr = Array.isArray(parsed) ? parsed : [];
+        const results: SsoProviderConfig[] = [];
+        for (const entry of arr) {
+          const r = ssoProviderConfigSchema.safeParse(entry);
+          if (r.success) results.push(r.data);
+        }
+        return results;
+      } catch {
+        return [];
+      }
+    }
+    return fileConfig?.auth?.ssoProviders ?? [];
+  })();
+
   const allowedHostnamesFromEnvRaw = process.env.PAPERCLIP_ALLOWED_HOSTNAMES;
   const allowedHostnamesFromEnv = allowedHostnamesFromEnvRaw
     ? allowedHostnamesFromEnvRaw
@@ -322,6 +345,7 @@ export function loadConfig(): Config {
       process.env.PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL,
     ),
     authDisableSignUp,
+    ssoProviders,
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,

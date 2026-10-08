@@ -14,9 +14,10 @@
  */
 
 import express from "express";
+import { createHash } from "node:crypto";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { authAccounts, createDb } from "@paperclipai/db";
+import { authAccounts, createDb, invites } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -27,6 +28,7 @@ import type { Config } from "../config.js";
 const ORIGIN = "http://127.0.0.1:41999";
 const EMAIL = "founder@example.com";
 const PASSWORD = "correct-horse-battery-staple";
+const INVITE_TOKEN = "pcp_bootstrap_credential-signup-test";
 
 // The issuer Better Auth stamps on an email/password account:
 // `createLocalAccountIssuer("credential")`. Sign-in matches on it, so a row
@@ -46,6 +48,7 @@ function testConfig(): Config {
     authBaseUrlMode: "explicit",
     authPublicBaseUrl: ORIGIN,
     authDisableSignUp: false,
+    ssoProviders: [],
     allowedHostnames: ["127.0.0.1"],
     port: 41999,
   } as unknown as Config;
@@ -74,6 +77,13 @@ describeEmbeddedPostgres("Better Auth credential sign-up against the real schema
 
     database = await startEmbeddedPostgresTestDatabase("paperclip-better-auth-signup-");
     db = createDb(database.connectionString);
+    await db.insert(invites).values({
+      inviteType: "bootstrap_ceo",
+      tokenHash: createHash("sha256").update(INVITE_TOKEN).digest("hex"),
+      allowedJoinTypes: "human",
+      expiresAt: new Date(Date.now() + 60_000),
+      invitedByUserId: "system",
+    });
 
     const auth = createBetterAuthInstance(db, testConfig(), [ORIGIN]);
     app = express();
@@ -94,6 +104,7 @@ describeEmbeddedPostgres("Better Auth credential sign-up against the real schema
     const signUp = await request(app)
       .post("/api/auth/sign-up/email")
       .set("origin", ORIGIN)
+      .set("referer", `${ORIGIN}/invite/${INVITE_TOKEN}`)
       .send({ email: EMAIL, password: PASSWORD, name: "Founder" });
 
     // A missing `account` column fails here with a 500 and an empty body.

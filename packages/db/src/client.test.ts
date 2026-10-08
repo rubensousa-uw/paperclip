@@ -13,6 +13,7 @@ import {
   createDb,
   ensurePostgresDatabase,
   inspectMigrations,
+  quoteLiteral,
   resetPostgresDatabase,
 } from "./client.js";
 import {
@@ -2065,6 +2066,69 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       } finally {
         await verifySql.end();
       }
+    },
+    30_000,
+  );
+
+  it(
+    "applies all migrations with 0306 last and reconciles its already-applied DDL",
+    async () => {
+      const connectionString = await createTempDatabase();
+
+      await applyPendingMigrations(connectionString);
+
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const ssoMigrationHash = await migrationHash(
+          "0306_sso_instance_settings.sql",
+        );
+
+        // createTempDatabase bootstraps an empty embedded database with every
+        // migration. Verify the whole history before exercising reconciliation.
+        const journal = JSON.parse(await fs.promises.readFile(
+          new URL("./migrations/meta/_journal.json", import.meta.url), "utf8",
+        )) as { entries: Array<{ idx: number; tag: string; when: number }> };
+        expect(journal.entries.at(-1)).toMatchObject({ idx: 306, tag: "0306_sso_instance_settings" });
+        expect(journal.entries.at(-1)!.when).toBeGreaterThan(journal.entries.at(-2)!.when);
+        const expectedHashes = await Promise.all(
+          journal.entries.map((entry) => migrationHash(`${entry.tag}.sql`)),
+        );
+        const history = await sql<{ hash: string }[]>`
+          SELECT hash FROM "drizzle"."__drizzle_migrations" ORDER BY id
+        `;
+        expect(history.map((entry) => entry.hash)).toEqual(expectedHashes);
+        expect(history.at(-1)?.hash).toBe(ssoMigrationHash);
+
+        // Simulate the upgrade path: an existing installation whose "sso"
+        // column already exists but whose history row for 0306 is missing.
+        // Deleting 0306's history row here reproduces that state (0306's DDL
+        // already ran once via applyPendingMigrations() above, so the column
+        // exists, but its history row is what reconcilePendingMigrationHistory()
+        // must repair without re-running the ALTER TABLE).
+        await sql.unsafe(
+          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = ${quoteLiteral(ssoMigrationHash)}`,
+        );
+
+        const columns = await sql.unsafe<{ column_name: string }[]>(
+          `
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'instance_settings'
+              AND column_name = 'sso'
+          `,
+        );
+        expect(columns).toHaveLength(1);
+      } finally {
+        await sql.end();
+      }
+
+      await expect(
+        applyPendingMigrations(connectionString),
+      ).resolves.toBeUndefined();
+      await expect(inspectMigrations(connectionString)).resolves.toMatchObject({
+        status: "upToDate",
+      });
     },
     30_000,
   );

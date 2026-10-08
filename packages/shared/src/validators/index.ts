@@ -50,6 +50,9 @@ export {
   patchInstanceSettingsSchema,
   type InstanceExperimentalSettings,
   type PatchInstanceExperimentalSettings,
+  instanceSsoSettingsSchema,
+  patchInstanceSsoSettingsSchema,
+  type PatchInstanceSsoSettings,
   type PatchInstanceSettings,
 } from "./instance.js";
 
