@@ -14,7 +14,7 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
+import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON, isUuidLike } from "@paperclipai/shared";
 import { parseObject } from "../../../adapters/utils.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { budgetService } from "../../../services/budgets.js";
@@ -528,12 +528,33 @@ export function createPostgresRunDispatchAdapter(
     );
 
     const wakeCommentId = deriveCommentId(context);
-    const isInteractionWake = allowsIssueInteractionWake(
-      context,
-      ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-    );
-    const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
+    const rawInteractionId = readNonEmptyString(context.interactionId);
+    // A malformed id must not reach the uuid column and abort the locked transaction.
+    const interactionId = rawInteractionId && isUuidLike(rawInteractionId) ? rawInteractionId : null;
+    const isAddressedPendingInteractionWake =
+      wakeReason === "interaction_pending" && interactionId
+        ? await dbOrTx
+            .select({ id: issueThreadInteractions.id })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.id, interactionId),
+                eq(issueThreadInteractions.companyId, input.companyId),
+                eq(issueThreadInteractions.issueId, issueId),
+                eq(issueThreadInteractions.status, "pending"),
+                eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+              ),
+            )
+            .limit(1)
+            .then((rows) => Boolean(rows[0]))
+        : false;
+    // interaction_pending wakes target the interaction's addressee (e.g. a
+    // reviewer), who is not necessarily the issue assignee.
+    const isInteractionWake =
+      allowsIssueInteractionWake(context, ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS) ||
+      isAddressedPendingInteractionWake;
+    const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const retryReason =
       readNonEmptyString(context.retryReason) ?? input.scheduledRetryReason ?? null;
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);
@@ -605,6 +626,7 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      isAddressedPendingInteractionWake,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,

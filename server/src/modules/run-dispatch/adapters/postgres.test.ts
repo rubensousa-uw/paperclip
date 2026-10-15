@@ -13,6 +13,7 @@ import {
   issueDocuments,
   issueRelations,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
 } from "@paperclipai/db";
@@ -152,6 +153,22 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       updatedAt: now,
     });
     return runId;
+  }
+
+  async function seedInteraction(input: {
+    companyId: string;
+    issueId: string;
+    addresseeAgentId: string;
+  }) {
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      ...input,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { version: 1, prompt: "Please review this issue" },
+    });
+    return interactionId;
   }
 
   async function seedContinuationSummary(input: {
@@ -611,6 +628,149 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         outcome: "cancelled",
         errorCode: "issue_assignee_changed",
       });
+    });
+
+    it("does not cancel an interaction_pending wake for a non-assignee addressee", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const assigneeAgentId = randomUUID();
+      await seedAgent({ id: assigneeAgentId, companyId, name: "Assignee" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_review", assigneeAgentId });
+      const interactionId = await seedInteraction({ companyId, issueId, addresseeAgentId: agentId });
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot: { issueId, wakeReason: "interaction_pending", interactionId },
+      });
+
+      const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+
+      expect(result).not.toMatchObject({ errorCode: "issue_assignee_changed" });
+      expect(result.outcome).not.toBe("cancelled");
+      expect(result).toMatchObject({ outcome: "not_stale" });
+    });
+
+    it.each([
+      "todo",
+      "in_review with another participant",
+      "answered",
+      "accepted",
+      "cancelled",
+      "addressee changed",
+      "no interactionId",
+      "missing interaction",
+      "malformed interactionId",
+      "answered while in_review with another participant",
+      "different company",
+      "different issue",
+      "on_demand",
+      "manual",
+      "terminal issue",
+    ])("binds interaction_pending authority: %s", async (scenario) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const assigneeAgentId = randomUUID();
+      const otherAgentId = randomUUID();
+      await seedAgent({ id: assigneeAgentId, companyId, name: "Assignee" });
+      await seedAgent({ id: otherAgentId, companyId, name: "Other participant" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "todo", assigneeAgentId });
+      const interactionId = await seedInteraction({ companyId, issueId, addresseeAgentId: agentId });
+      const contextSnapshot = { issueId, wakeReason: "interaction_pending", interactionId };
+      const runId = await seedRun({ companyId, agentId, contextSnapshot });
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const check = () => adapter.cancelStaleQueuedRun({
+        runId, companyId, expectedStatus: "queued", now: new Date(),
+      });
+
+      // Positive control: the same wake is valid before the matrix mutation.
+      expect(await check()).toMatchObject({ outcome: "not_stale" });
+      expect(await db.select({ profile: heartbeatRuns.runnerProfileJson })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))
+        .toMatchObject([{ profile: { aiConnectionNonAssigneeCommentWake: true } }]);
+
+      if (scenario === "in_review with another participant") {
+        await db.update(issues).set({
+          status: "in_review",
+          executionState: {
+            status: "pending",
+            currentStageId: randomUUID(),
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: otherAgentId, userId: null },
+            returnAssignee: { type: "agent", agentId: assigneeAgentId, userId: null },
+            reviewRequest: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        }).where(eq(issues.id, issueId));
+      } else if (scenario === "answered while in_review with another participant") {
+        await db.update(issues).set({
+          status: "in_review",
+          executionState: {
+            status: "pending",
+            currentStageId: randomUUID(),
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: otherAgentId, userId: null },
+            returnAssignee: { type: "agent", agentId: assigneeAgentId, userId: null },
+            reviewRequest: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        }).where(eq(issues.id, issueId));
+        await db.update(issueThreadInteractions).set({ status: "answered" })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      } else if (scenario === "malformed interactionId") {
+        await db.update(heartbeatRuns).set({
+          contextSnapshot: { ...contextSnapshot, interactionId: "not-a-uuid" },
+        }).where(eq(heartbeatRuns.id, runId));
+      } else if (["answered", "accepted", "cancelled"].includes(scenario)) {
+        await db.update(issueThreadInteractions).set({ status: scenario })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      } else if (scenario === "addressee changed") {
+        await db.update(issueThreadInteractions).set({ addresseeAgentId: otherAgentId })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      } else if (scenario === "no interactionId") {
+        await db.update(heartbeatRuns).set({
+          contextSnapshot: { issueId, wakeReason: "interaction_pending" },
+        }).where(eq(heartbeatRuns.id, runId));
+      } else if (scenario === "missing interaction") {
+        await db.update(heartbeatRuns).set({
+          contextSnapshot: { ...contextSnapshot, interactionId: randomUUID() },
+        }).where(eq(heartbeatRuns.id, runId));
+      } else if (scenario === "different company") {
+        const other = await seedCompanyAndAgent();
+        await db.update(issueThreadInteractions).set({ companyId: other.companyId })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      } else if (scenario === "different issue") {
+        const otherIssueId = randomUUID();
+        await seedIssue({ companyId, issueId: otherIssueId, status: "todo", assigneeAgentId });
+        await db.update(issueThreadInteractions).set({ issueId: otherIssueId })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      } else if (scenario === "on_demand" || scenario === "manual") {
+        await db.update(heartbeatRuns).set({
+          contextSnapshot: { ...contextSnapshot, wakeReason: scenario },
+        }).where(eq(heartbeatRuns.id, runId));
+      } else if (scenario === "terminal issue") {
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      }
+
+      const result = await check();
+      if (scenario === "todo" || scenario === "in_review with another participant") {
+        expect(result).toMatchObject({ outcome: "not_stale" });
+      } else {
+        expect(result).toMatchObject({
+          outcome: "cancelled",
+          errorCode: scenario === "terminal issue" ? "issue_terminal_status" : "issue_assignee_changed",
+        });
+      }
     });
 
     it(
