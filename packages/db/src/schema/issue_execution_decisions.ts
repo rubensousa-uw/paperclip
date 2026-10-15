@@ -16,6 +16,7 @@ export const issueExecutionDecisions = pgTable(
     actorUserId: text("actor_user_id"),
     outcome: text("outcome").notNull(),
     body: text("body").notNull(),
+    headSha: text("head_sha"),
     createdByRunId: uuid("created_by_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

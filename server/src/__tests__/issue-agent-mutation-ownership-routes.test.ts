@@ -31,6 +31,7 @@ const mockIssueService = vi.hoisted(() => ({
   list: vi.fn(),
   listAttachments: vi.fn(),
   listComments: vi.fn(),
+  listExecutionDecisions: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   remove: vi.fn(),
   removeAttachment: vi.fn(),
@@ -520,6 +521,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.list.mockReset();
     mockIssueService.listAttachments.mockReset();
     mockIssueService.listComments.mockReset();
+    mockIssueService.listExecutionDecisions.mockReset();
     mockIssueService.listWakeableBlockedDependents.mockReset();
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockReset();
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
@@ -1012,6 +1014,52 @@ describe("agent issue mutation checkout ownership", () => {
       order: "desc",
       limit: null,
     });
+  });
+
+  it("rejects peer agents from listing execution decisions when issue read is outside their boundary", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_low_trust_boundary",
+      explanation: "Issue is outside this low-trust boundary.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .get(`/api/issues/${issueId}/execution-decisions`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
+    expect(mockIssueService.listExecutionDecisions).not.toHaveBeenCalled();
+  });
+
+  it("allows peer agents with an issue read grant to list execution decisions", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_company_agent" : "deny_missing_grant",
+      explanation: input.action === "issue:read" ? "Allowed company agent read." : "Missing permission.",
+    }));
+    const decision = {
+      id: "88888888-8888-4888-8888-888888888888",
+      stageId: "99999999-9999-4999-8999-999999999999",
+      stageType: "review",
+      outcome: "changes_requested",
+      actorAgentId: ownerAgentId,
+      actorUserId: null,
+      createdByRunId: ownerRunId,
+      createdAt: "2026-10-15T12:00:00.000Z",
+      headSha: "0123456789abcdef0123456789abcdef01234567",
+    };
+    mockIssueService.listExecutionDecisions.mockResolvedValue([decision]);
+
+    const res = await request(await createApp(peerActor()))
+      .get(`/api/issues/${issueId}/execution-decisions`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual([decision]);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
+    expect(mockIssueService.listExecutionDecisions).toHaveBeenCalledWith(issueId);
   });
 
   it("rejects peer agents from reading a specific comment when issue read is outside their boundary", async () => {

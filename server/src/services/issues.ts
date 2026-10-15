@@ -7,7 +7,7 @@ import { documentService } from "./documents.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
-import type { ExecutionProjection } from "@paperclipai/shared";
+import type { ExecutionProjection, IssueExecutionDecisionListItem } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
@@ -66,6 +66,7 @@ import {
   issueRelations,
   issueComments,
   issueDocuments,
+  issueExecutionDecisions,
   issueQuestionResponseDeliveries,
   issueWorkProducts,
   issueReadStates,
@@ -12118,6 +12119,32 @@ export function issueService(db: Db) {
         latestCommentAt: latest?.latestCommentAt ?? null,
       };
     },
+
+    /**
+     * Every execution decision of the issue, untruncated, in a total order
+     * (createdAt asc, id asc) so each review round — rejected ones included —
+     * can be recovered with the head the deciding actor declared. The order is
+     * an approximate chronology (transaction timestamps, ties broken by id);
+     * the authoritative latest decision is the issue's
+     * executionState.lastDecisionId / lastDecisionHeadSha.
+     */
+    listExecutionDecisions: async (issueId: string): Promise<IssueExecutionDecisionListItem[]> =>
+      db
+        .select({
+          id: issueExecutionDecisions.id,
+          stageId: issueExecutionDecisions.stageId,
+          stageType: issueExecutionDecisions.stageType,
+          outcome: issueExecutionDecisions.outcome,
+          actorAgentId: issueExecutionDecisions.actorAgentId,
+          actorUserId: issueExecutionDecisions.actorUserId,
+          createdByRunId: issueExecutionDecisions.createdByRunId,
+          createdAt: issueExecutionDecisions.createdAt,
+          headSha: issueExecutionDecisions.headSha,
+        })
+        .from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.issueId, issueId))
+        .orderBy(asc(issueExecutionDecisions.createdAt), asc(issueExecutionDecisions.id))
+        .then((rows) => rows as IssueExecutionDecisionListItem[]),
 
     getComment: async (commentId: string) => {
       const { censorUsernameInLogs } = await instanceSettings.getGeneral();

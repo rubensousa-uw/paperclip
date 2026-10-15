@@ -57,8 +57,11 @@ interface IssueExecutionState {
   completedStageIds: string[];
   lastDecisionId: string | null;
   lastDecisionOutcome: "approved" | "changes_requested" | null;
+  lastDecisionHeadSha?: string | null; // head declared on the last decision
 }
 ```
+
+`lastDecisionHeadSha` is the commit the deciding actor declared on the last decision (`headSha`, see below). Every new decision sets it, and a decision without `headSha` clears it to `null`. It is carried across stage transitions. Transitions that reset `executionState` to `null` clear it together with `lastDecisionId`: reopening a `done` or `cancelled` issue, board overrides, a policy removal and the wake-queue reopen. The decision rows keep the history.
 
 ### Execution Decisions (table: `issue_execution_decisions`)
 
@@ -75,10 +78,15 @@ interface IssueExecutionDecision {
   actorUserId: string | null;
   outcome: "approved" | "changes_requested";
   body: string;              // required comment explaining the decision
+  headSha: string | null;    // commit the actor declared it examined
   createdByRunId: string | null;
   createdAt: Date;
 }
 ```
+
+**Declared head (`headSha`).** The request that records a decision may carry an optional `headSha`: the full lowercase hex id of the commit the actor examined, 40 characters (SHA-1) or 64 (SHA-256). It is accepted on `PATCH /api/issues/{issueId}`, on a review-approval `POST /api/issues/{issueId}/comments`, and on `POST /api/issues/{issueId}/recovery-actions/resolve`. Omitting it, or sending `null`, stores `null`. A malformed value returns `400`. A `headSha` on a request that records no decision returns `422` with code `head_sha_without_decision`. The value is the actor's declaration for audit. Paperclip does not check it against any repository.
+
+**Decision history.** `GET /api/issues/{issueId}/execution-decisions` lists every decision of the issue, without truncation. Rows are ordered by `createdAt` ascending, then `id`. This is an approximate chronology: timestamps come from the transaction, and ties are broken by id. Each row has `id`, `stageId`, `stageType`, `outcome`, `actorAgentId`, `actorUserId`, `createdByRunId`, `createdAt` and `headSha`. The authoritative latest decision is `executionState.lastDecisionId` / `lastDecisionHeadSha`. Reading the list needs the same access as reading the issue's comments.
 
 ## Workflow
 

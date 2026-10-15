@@ -963,6 +963,78 @@ describe("issue execution policy transitions", () => {
     });
   });
 
+  describe("lastDecisionHeadSha", () => {
+    const policy = reviewOnlyPolicy();
+    const reviewStageId = policy.stages[0].id;
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const decisionId = "44444444-4444-4444-8444-444444444444";
+
+    it("survives a transition that records no decision while the execution state is kept", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "changes_requested",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: decisionId,
+            lastDecisionOutcome: "changes_requested",
+            lastDecisionHeadSha: sha,
+          },
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.decision).toBeUndefined();
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        lastDecisionId: decisionId,
+        lastDecisionHeadSha: sha,
+      });
+    });
+
+    it("is cleared together with lastDecisionId when the transition resets the execution state", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "done",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "completed",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [reviewStageId],
+            lastDecisionId: decisionId,
+            lastDecisionOutcome: "approved",
+            lastDecisionHeadSha: sha,
+          },
+        },
+        policy,
+        requestedStatus: "todo",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+      });
+
+      // A reset drops the whole projection (lastDecisionId included); the
+      // decision rows and GET /issues/:id/execution-decisions keep the history.
+      expect(result.patch.executionState).toBeNull();
+    });
+  });
+
   describe("no-op transitions", () => {
     const policy = twoStagePolicy();
     const reviewStageId = policy.stages[0].id;
@@ -1252,6 +1324,81 @@ describe("issue execution policy transitions", () => {
           returnAssignee: { type: "agent", agentId: coderAgentId },
           completedStageIds: [policy.stages[0].id],
         },
+      });
+    });
+
+    describe("with a seeded lastDecisionHeadSha", () => {
+      const seededSha = "0123456789abcdef0123456789abcdef01234567";
+      const seededDecisionId = "55555555-5555-4555-8555-555555555555";
+      const seededState = {
+        status: "idle" as const,
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: seededDecisionId,
+        lastDecisionOutcome: "changes_requested" as const,
+        lastDecisionHeadSha: seededSha,
+      };
+
+      it("keeps it through buildSkippedStageCompletedState when the only stage is skipped", () => {
+        const policy = makePolicy([
+          { type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
+        ]);
+        const result = applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_progress",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: seededState,
+          },
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+          commentBody: "Done",
+        });
+
+        expect(result.decision).toBeUndefined();
+        expect(result.patch.executionState).toMatchObject({
+          status: "completed",
+          completedStageIds: [policy.stages[0].id],
+          lastDecisionId: seededDecisionId,
+          lastDecisionHeadSha: seededSha,
+        });
+      });
+
+      it("keeps it through buildStateWithCompletedStages when a skipped review advances to approval", () => {
+        const policy = makePolicy([
+          { type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
+          { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+        ]);
+        const result = applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_progress",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: seededState,
+          },
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+          commentBody: "Done",
+        });
+
+        expect(result.decision).toBeUndefined();
+        expect(result.patch.executionState).toMatchObject({
+          status: "pending",
+          currentStageType: "approval",
+          completedStageIds: [policy.stages[0].id],
+          lastDecisionId: seededDecisionId,
+          lastDecisionHeadSha: seededSha,
+        });
       });
     });
   });

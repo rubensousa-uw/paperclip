@@ -2071,7 +2071,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
   );
 
   it(
-    "applies all migrations with 0306 last and reconciles its already-applied DDL",
+    "applies all migrations with the SSO 0306 and reconciles its already-applied DDL",
     async () => {
       const connectionString = await createTempDatabase();
 
@@ -2088,8 +2088,16 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
         const journal = JSON.parse(await fs.promises.readFile(
           new URL("./migrations/meta/_journal.json", import.meta.url), "utf8",
         )) as { entries: Array<{ idx: number; tag: string; when: number }> };
-        expect(journal.entries.at(-1)).toMatchObject({ idx: 306, tag: "0306_sso_instance_settings" });
-        expect(journal.entries.at(-1)!.when).toBeGreaterThan(journal.entries.at(-2)!.when);
+        const ssoIndex = journal.entries.findIndex((entry) => entry.tag === "0306_sso_instance_settings");
+        expect(ssoIndex).toBeGreaterThan(0);
+        expect(journal.entries[ssoIndex]).toEqual({
+          idx: 306,
+          version: "7",
+          when: 1791417600000,
+          tag: "0306_sso_instance_settings",
+          breakpoints: true,
+        });
+        expect(journal.entries[ssoIndex]!.when).toBeGreaterThan(journal.entries[ssoIndex - 1]!.when);
         const expectedHashes = await Promise.all(
           journal.entries.map((entry) => migrationHash(`${entry.tag}.sql`)),
         );
@@ -2097,7 +2105,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
           SELECT hash FROM "drizzle"."__drizzle_migrations" ORDER BY id
         `;
         expect(history.map((entry) => entry.hash)).toEqual(expectedHashes);
-        expect(history.at(-1)?.hash).toBe(ssoMigrationHash);
+        expect(history[ssoIndex]?.hash).toBe(ssoMigrationHash);
 
         // Simulate the upgrade path: an existing installation whose "sso"
         // column already exists but whose history row for 0306 is missing.
@@ -2129,6 +2137,97 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       await expect(inspectMigrations(connectionString)).resolves.toMatchObject({
         status: "upToDate",
       });
+    },
+    30_000,
+  );
+
+  it(
+    "applies 0307 after the SSO 0306 as an additive nullable head_sha column that existing decision rows read as null",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+
+      const headShaMigrationHash = await migrationHash("0307_issue_execution_decision_head_sha.sql");
+      const journal = JSON.parse(await fs.promises.readFile(
+        new URL("./migrations/meta/_journal.json", import.meta.url), "utf8",
+      )) as { entries: Array<{ idx: number; tag: string; when: number }> };
+      const ssoIndex = journal.entries.findIndex((entry) => entry.tag === "0306_sso_instance_settings");
+      const headShaIndex = journal.entries.findIndex(
+        (entry) => entry.tag === "0307_issue_execution_decision_head_sha",
+      );
+      expect(ssoIndex).toBeGreaterThan(0);
+      expect(headShaIndex).toBe(ssoIndex + 1);
+      expect(journal.entries[headShaIndex]).toEqual({
+        idx: 307,
+        version: "7",
+        when: 1791504000000,
+        tag: "0307_issue_execution_decision_head_sha",
+        breakpoints: true,
+      });
+      expect(journal.entries[headShaIndex]!.when).toBeGreaterThan(journal.entries[ssoIndex]!.when);
+
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const history = await sql<{ hash: string }[]>`
+          SELECT hash FROM "drizzle"."__drizzle_migrations" ORDER BY id
+        `;
+        expect(history[headShaIndex]?.hash).toBe(headShaMigrationHash);
+
+        // Rewind to a pre-0307 database holding an existing decision row.
+        await sql.unsafe(`ALTER TABLE "issue_execution_decisions" DROP COLUMN "head_sha"`);
+        await sql.unsafe(
+          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = ${quoteLiteral(headShaMigrationHash)}`,
+        );
+        const [company] = await sql<{ id: string }[]>`
+          INSERT INTO "companies" ("name", "issue_prefix") VALUES ('Head sha Co', 'HSM') RETURNING "id"
+        `;
+        const [issue] = await sql<{ id: string }[]>`
+          INSERT INTO "issues" ("company_id", "title") VALUES (${company!.id}, 'Pre-0307 issue') RETURNING "id"
+        `;
+        await sql`
+          INSERT INTO "issue_execution_decisions" ("company_id", "issue_id", "stage_id", "stage_type", "outcome", "body")
+          VALUES (${company!.id}, ${issue!.id}, gen_random_uuid(), 'review', 'approved', 'Approved before 0307.')
+        `;
+        await expect(inspectMigrations(connectionString)).resolves.toMatchObject({ status: "needsMigrations" });
+      } finally {
+        await sql.end();
+      }
+
+      await applyPendingMigrations(connectionString);
+      await expect(inspectMigrations(connectionString)).resolves.toMatchObject({ status: "upToDate" });
+
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const columns = await verifySql<{ data_type: string; is_nullable: string; column_default: string | null }[]>`
+          SELECT data_type, is_nullable, column_default
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'issue_execution_decisions'
+            AND column_name = 'head_sha'
+        `;
+        expect(columns).toEqual([{ data_type: "text", is_nullable: "YES", column_default: null }]);
+        const rows = await verifySql<{ head_sha: string | null }[]>`
+          SELECT head_sha FROM "issue_execution_decisions"
+        `;
+        expect(rows).toEqual([{ head_sha: null }]);
+        // text, no length limit: a SHA-256 object id (64 hex) fits as well as SHA-1.
+        const sha256 = "0123456789abcdef".repeat(4);
+        await verifySql`UPDATE "issue_execution_decisions" SET head_sha = ${sha256}`;
+        const widened = await verifySql<{ head_sha: string }[]>`
+          SELECT head_sha FROM "issue_execution_decisions"
+        `;
+        expect(widened).toEqual([{ head_sha: sha256 }]);
+        const history = await verifySql<{ hash: string }[]>`
+          SELECT hash FROM "drizzle"."__drizzle_migrations" WHERE hash = ${headShaMigrationHash}
+        `;
+        expect(history).toHaveLength(1);
+      } finally {
+        await verifySql.end();
+      }
+
+      // A second boot has nothing pending and does not re-run 0307.
+      await applyPendingMigrations(connectionString);
+      await expect(inspectMigrations(connectionString)).resolves.toMatchObject({ status: "upToDate" });
     },
     30_000,
   );

@@ -126,6 +126,7 @@ function blankExecutionState(): IssueExecutionState {
     completedStageIds: [],
     lastDecisionId: null,
     lastDecisionOutcome: null,
+    lastDecisionHeadSha: null,
     monitor: null,
   };
 }
@@ -524,6 +525,7 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     reviewRequest: null,
     completedStageIds,
     lastDecisionId: previous?.lastDecisionId ?? null,
+    lastDecisionHeadSha: previous?.lastDecisionHeadSha ?? null,
     lastDecisionOutcome: "approved",
     monitor: previous?.monitor ?? null,
     changesRequestedCount: 0,
@@ -545,6 +547,7 @@ function buildStateWithCompletedStages(input: {
     reviewRequest: input.previous?.reviewRequest ?? null,
     completedStageIds: input.completedStageIds,
     lastDecisionId: input.previous?.lastDecisionId ?? null,
+    lastDecisionHeadSha: input.previous?.lastDecisionHeadSha ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
   };
@@ -565,6 +568,7 @@ function buildSkippedStageCompletedState(input: {
     reviewRequest: null,
     completedStageIds: input.completedStageIds,
     lastDecisionId: input.previous?.lastDecisionId ?? null,
+    lastDecisionHeadSha: input.previous?.lastDecisionHeadSha ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
   };
@@ -589,6 +593,7 @@ function buildPendingState(input: {
     reviewRequest: input.reviewRequest ?? null,
     completedStageIds: input.previous?.completedStageIds ?? [],
     lastDecisionId: input.previous?.lastDecisionId ?? null,
+    lastDecisionHeadSha: input.previous?.lastDecisionHeadSha ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,

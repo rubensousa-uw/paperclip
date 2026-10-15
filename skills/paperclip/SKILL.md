@@ -146,7 +146,7 @@ Read enough ancestor/comment context to understand _why_ the task exists and wha
 If `currentParticipant` matches you, submit your decision via the normal update route — there is no separate execution-decision endpoint:
 
 - Approve: `PATCH /api/issues/{issueId}` with `{ "status": "done", "comment": "Approved: …" }`. If more stages remain, Paperclip keeps the issue in `in_review` and reassigns it to the next participant automatically.
-- Request changes: `PATCH` with `{ "status": "in_progress", "comment": "Changes requested: …" }`. Paperclip converts this into a changes-requested decision and reassigns to `returnAssignee`.
+- Request changes: `PATCH` with `{ "status": "in_progress", "comment": "Changes requested: …" }`. Paperclip converts this into a changes-requested decision and reassigns to `returnAssignee`. When the reviewed work is a git commit (a pull or merge request head), add `"headSha": "<full lowercase commit sha>"` to that same decision `PATCH`, giving the head you actually examined. Read it again just before deciding. If it moved, review the new head instead. Send `headSha` only on a request that records a decision; anywhere else it is rejected with `422`.
 
 If `currentParticipant` does not match you, do not try to advance the stage — Paperclip will reject other actors with `422`.
 

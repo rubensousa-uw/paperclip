@@ -501,6 +501,36 @@ export const issueReviewRequestSchema = z
   })
   .strict();
 
+/**
+ * The commit a deciding actor declares it examined: a full lowercase hex
+ * object id, 40 characters (SHA-1) or 64 (SHA-256 repositories). It is the
+ * actor's audit declaration, not proof.
+ */
+export const issueExecutionDecisionHeadShaSchema = z
+  .string()
+  .regex(
+    /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/,
+    "headSha must be a full lowercase hex commit SHA (40 or 64 characters)",
+  );
+
+/**
+ * One row of `GET /issues/:id/execution-decisions`. Rows are ordered by
+ * createdAt asc, id asc: an approximate chronology (transaction timestamps,
+ * ties broken by id). The authoritative latest decision is the issue's
+ * `executionState.lastDecisionId` / `lastDecisionHeadSha`.
+ */
+export const issueExecutionDecisionListItemSchema = z.object({
+  id: z.string().uuid(),
+  stageId: z.string().uuid(),
+  stageType: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
+  outcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES),
+  actorAgentId: z.string().uuid().nullable(),
+  actorUserId: z.string().nullable(),
+  createdByRunId: z.string().uuid().nullable(),
+  createdAt: z.string().datetime(),
+  headSha: issueExecutionDecisionHeadShaSchema.nullable(),
+});
+
 export const issueExecutionStateSchema = z.object({
   status: z.enum(ISSUE_EXECUTION_STATE_STATUSES),
   currentStageId: z.string().guid().nullable(),
@@ -512,6 +542,8 @@ export const issueExecutionStateSchema = z.object({
   completedStageIds: z.array(z.string().guid()).default([]),
   lastDecisionId: z.string().guid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
+  // A malformed stored value must not invalidate the whole state: it reads null.
+  lastDecisionHeadSha: issueExecutionDecisionHeadShaSchema.nullable().optional().default(null).catch(null),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
 });
@@ -578,6 +610,7 @@ export const resolveIssueRecoveryActionSchema = z
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
     sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
     resolutionNote: multilineTextSchema.optional().nullable(),
+    headSha: issueExecutionDecisionHeadShaSchema.optional().nullable(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -889,6 +922,8 @@ export const updateIssueSchema = objectWithoutDefaults(
     onBehalfOfUserId: z.string().trim().min(1).optional().nullable(),
     reviewInteractionId: z.string().guid().optional(),
     reviewRequest: issueReviewRequestSchema.optional().nullable(),
+    /** Commit examined by the actor; stored on the execution decision this update creates, if any. */
+    headSha: issueExecutionDecisionHeadShaSchema.optional().nullable(),
     reopen: z.boolean().optional(),
     resume: z.boolean().optional(),
     interrupt: z.boolean().optional(),
@@ -1060,6 +1095,8 @@ export const addIssueCommentSchema = z.object({
   authorType: issueCommentAuthorTypeSchema.optional(),
   presentation: issueCommentPresentationSchema.nullable().optional(),
   metadata: issueCommentMetadataSchema.nullable().optional(),
+  /** Commit examined by the actor; stored on the execution decision a review-approval comment creates, if any. */
+  headSha: issueExecutionDecisionHeadShaSchema.optional().nullable(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),

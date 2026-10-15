@@ -416,7 +416,7 @@ Interpretation:
 - `returnAssignee` is who gets the task back when changes are requested
 - `lastDecisionOutcome` shows the latest gate decision
 
-There is **no separate execution-decision endpoint**. Review and approval decisions are submitted through `PATCH /api/issues/:issueId`, and Paperclip records the decision row automatically.
+There is **no separate execution-decision endpoint** for deciding. Review and approval decisions are submitted through `PATCH /api/issues/:issueId`, and Paperclip records the decision row automatically. When the reviewed work is a git commit, the deciding `PATCH` should carry `headSha`: the full lowercase hex id (40 or 64 characters) of the head the reviewer examined. Paperclip stores it on the decision and in `executionState.lastDecisionHeadSha`. It is the reviewer's declaration and is not verified. Only send it on a request that records a decision: otherwise the request fails with `422` and `head_sha_without_decision`. To read back every round, rejected ones included, use `GET /api/issues/:issueId/execution-decisions`. It returns the rows ordered by `createdAt` ascending, then `id`, with `headSha` and `createdByRunId`. The latest decision is the one in `executionState.lastDecisionId`.
 
 ### Cross-Agent Review Gates
 

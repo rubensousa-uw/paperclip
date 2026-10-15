@@ -2066,6 +2066,84 @@ function actorMatchesExecutionParticipant(
 const APPROVAL_NEGATION_REGEX =
   /\b(?:NOT|REJECT(?:ED|ING|S)?|DENY|DENIED|DENYING|BLOCK(?:ED|ING|S)?|CHANGES?\s+REQUESTED)\b/i;
 
+export const HEAD_SHA_WITHOUT_DECISION_CODE = "head_sha_without_decision";
+export const EXECUTION_STATE_CHANGED_CODE = "execution_state_changed";
+
+type ExecutionTransitionResult = ReturnType<typeof applyIssueExecutionPolicyTransition>;
+type ExecutionTransitionIssue = Parameters<typeof applyIssueExecutionPolicyTransition>[0]["issue"];
+
+function executionStateChanged() {
+  return conflict(
+    "The issue's execution stage changed while this decision was being recorded; reload the issue and decide again",
+    { code: EXECUTION_STATE_CHANGED_CODE },
+  );
+}
+
+/**
+ * The stage outcome of a transition: the decision, the stage state it leads
+ * to, and the status and assignee it sets. Monitor bookkeeping (timestamps) and
+ * the decision id/head the route stamps afterwards are left out, so the same
+ * stage outcome computed twice compares equal.
+ */
+function stageOutcomeFingerprint(transition: ExecutionTransitionResult) {
+  const rawState = transition.patch.executionState;
+  let state: unknown = rawState ?? null;
+  if (rawState && typeof rawState === "object") {
+    const { monitor: _monitor, lastDecisionId: _id, lastDecisionHeadSha: _sha, ...rest } =
+      rawState as Record<string, unknown>;
+    state = rest;
+  }
+  return JSON.stringify({
+    decision: transition.decision ?? null,
+    status: transition.patch.status ?? null,
+    assigneeAgentId: transition.patch.assigneeAgentId,
+    assigneeUserId: transition.patch.assigneeUserId,
+    state,
+    workflowControlledAssignment: transition.workflowControlledAssignment ?? false,
+  });
+}
+
+/**
+ * A stage decision is first computed from an issue snapshot read before the
+ * write transaction; that snapshot only serves the early checks. Inside the
+ * transaction, after the row lock, the caller recomputes the transition from
+ * the locked row with the same request inputs, the way the recovery-action
+ * resolve already does, and writes that result. When the locked row no longer
+ * yields a decision, or yields a different stage outcome (another decision, a
+ * reassignment, a stage or policy change committed in between), the request
+ * is refused with 409 and writes nothing: its wake, activity and response were
+ * derived from the snapshot outcome. A concurrent write that does not touch
+ * the stage (a title edit) recomputes to the same outcome and passes.
+ */
+function recomputeDecisionUnderLock(
+  snapshotFingerprint: string,
+  recompute: () => ExecutionTransitionResult,
+): ExecutionTransitionResult {
+  let recomputed: ExecutionTransitionResult;
+  try {
+    recomputed = recompute();
+  } catch (error) {
+    if (error instanceof HttpError && error.status < 500) throw executionStateChanged();
+    throw error;
+  }
+  if (!recomputed.decision || stageOutcomeFingerprint(recomputed) !== snapshotFingerprint) {
+    throw executionStateChanged();
+  }
+  return recomputed;
+}
+
+/**
+ * `headSha` declares the commit a deciding actor examined, so it is only
+ * meaningful on a request that records an execution decision. Anywhere else it
+ * is rejected explicitly instead of being dropped silently.
+ */
+function headShaWithoutDecision() {
+  return unprocessable(
+    "headSha is accepted only on a request that records an execution decision",
+    { code: HEAD_SHA_WITHOUT_DECISION_CODE },
+  );
+}
+
 function isApprovalReviewComment(body: string) {
   const normalized = body.replace(/\r\n?/g, "\n");
   const headingMatch = normalized.match(/(?:^|\n)##\s*Review:\s*([^\n]*)/i);
@@ -9140,7 +9218,15 @@ export function issueRoutes(
         sourceIssueStatus,
         resolutionNote,
         executionReconciliation,
+        headSha: requestedHeadSha,
       } = req.body;
+      const decisionHeadSha = requestedHeadSha ?? null;
+      let recordedDecision: {
+        id: string;
+        stageId: string;
+        outcome: string;
+        headSha: string | null;
+      } | null = null;
       if (outcome === "false_positive" || outcome === "cancelled") {
         assertBoard(req);
       }
@@ -9475,6 +9561,7 @@ export function issueRoutes(
               updateFields.executionState = {
                 ...nextExecutionState,
                 lastDecisionId: decisionId,
+                lastDecisionHeadSha: decisionHeadSha,
               };
               await tx.insert(issueExecutionDecisions).values({
                 id: decisionId,
@@ -9486,8 +9573,15 @@ export function issueRoutes(
                 actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: transition.decision.outcome,
                 body: transition.decision.body,
+                headSha: decisionHeadSha,
                 createdByRunId: actor.runId ?? null,
               });
+              recordedDecision = {
+                id: decisionId,
+                stageId: transition.decision.stageId,
+                outcome: transition.decision.outcome,
+                headSha: decisionHeadSha,
+              };
             }
           }
 
@@ -9514,6 +9608,9 @@ export function issueRoutes(
           if (!updatedIssue) throw notFound("Issue not found");
           issue = updatedIssue;
         }
+
+        // Rolls back the whole resolution: a declared head needs a decision.
+        if (decisionHeadSha !== null && !recordedDecision) throw headShaWithoutDecision();
 
         const recordedOutcome =
           outcome === "restored" &&
@@ -9593,6 +9690,7 @@ export function issueRoutes(
           outcome: result.recoveryAction.outcome,
           sourceIssueStatus: sourceIssueStatus ?? null,
           resolutionNote: result.recoveryAction.resolutionNote,
+          ...(recordedDecision ? { executionDecision: recordedDecision } : {}),
         },
       });
 
@@ -12868,6 +12966,7 @@ export function issueRoutes(
         attachmentIds: commentAttachmentIds,
         reviewInteractionId: requestedReviewInteractionId,
         reviewRequest,
+        headSha: requestedDecisionHeadSha,
         reopen: reopenRequested,
         resume: resumeRequested,
         interrupt: interruptRequested,
@@ -13203,14 +13302,22 @@ export function issueRoutes(
         req.body.executionPolicy !== undefined && monitorChanged,
       );
 
-      const transition = applyIssueExecutionPolicyTransition({
-        issue: existing,
-        policy: nextExecutionPolicy,
-        previousPolicy: previousExecutionPolicy,
-        requestedStatus:
-          typeof updateFields.status === "string"
-            ? updateFields.status
-            : undefined,
+      // Request inputs are captured now: updateFields is later merged with the
+      // transition patch, and a recomputation must see the request, not that.
+      const requestedExecutionPolicy = updateFields.executionPolicy;
+      const requestedTransitionStatus =
+        typeof updateFields.status === "string" ? updateFields.status : undefined;
+      const computeExecutionTransition = (base: ExecutionTransitionIssue) => {
+        const basePolicy = normalizeIssueExecutionPolicy(base.executionPolicy ?? null);
+        const baseNextPolicy =
+          requestedExecutionPolicy !== undefined
+            ? (requestedExecutionPolicy as NormalizedExecutionPolicy | null)
+            : basePolicy;
+        return applyIssueExecutionPolicyTransition({
+        issue: base,
+        policy: baseNextPolicy,
+        previousPolicy: basePolicy,
+        requestedStatus: requestedTransitionStatus,
         requestedAssigneePatch: {
           assigneeAgentId: normalizedAssigneeAgentId,
           assigneeUserId:
@@ -13226,8 +13333,14 @@ export function issueRoutes(
         commentBody,
         reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
         monitorExplicitlyUpdated:
-          req.body.executionPolicy !== undefined && monitorChanged,
-      });
+          req.body.executionPolicy !== undefined &&
+          monitorPoliciesEqual(basePolicy, baseNextPolicy) === false,
+        });
+      };
+      const transition = computeExecutionTransition(existing);
+      const transitionFingerprint = stageOutcomeFingerprint(transition);
+      const decisionHeadSha = requestedDecisionHeadSha ?? null;
+      if (decisionHeadSha !== null && !transition.decision) throw headShaWithoutDecision();
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
@@ -13239,8 +13352,20 @@ export function issueRoutes(
         transition.patch.executionState = {
           ...nextExecutionState,
           lastDecisionId: decisionId,
+          lastDecisionHeadSha: decisionHeadSha,
         };
       }
+      const executionDecisionActivity =
+        decisionId && transition.decision
+          ? {
+              executionDecision: {
+                id: decisionId,
+                stageId: transition.decision.stageId,
+                outcome: transition.decision.outcome,
+                headSha: decisionHeadSha,
+              },
+            }
+          : {};
       Object.assign(updateFields, transition.patch);
 
       const nextStatus = updateFields.status ?? existing.status;
@@ -13656,6 +13781,7 @@ export function issueRoutes(
                 ? { resumeIntent: true, followUpRequested: true }
                 : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
+              ...executionDecisionActivity,
               _previous: Object.keys(changes).length > 0 ? previous : undefined,
             },
           },
@@ -13720,6 +13846,22 @@ export function issueRoutes(
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (decision) {
+              const lockedIssue = await svc.getByIdForUpdate(id, tx);
+              if (!lockedIssue || lockedIssue.companyId !== existing.companyId) {
+                throw notFound("Issue not found");
+              }
+              const recomputed = recomputeDecisionUnderLock(transitionFingerprint, () =>
+                computeExecutionTransition(lockedIssue),
+              );
+              Object.assign(issueUpdateData, recomputed.patch, {
+                executionState: {
+                  ...(recomputed.patch.executionState as Record<string, unknown>),
+                  lastDecisionId: decisionId,
+                  lastDecisionHeadSha: decisionHeadSha,
+                },
+              });
+            }
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -13762,6 +13904,7 @@ export function issueRoutes(
                 actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: decision.outcome,
                 body: decision.body,
+                headSha: decisionHeadSha,
                 createdByRunId: actor.runId ?? null,
               });
             }
@@ -14054,6 +14197,7 @@ export function issueRoutes(
             ...(interruptedRunId ? { interruptedRunId } : {}),
             ...(cancelledStatusRunId ? { cancelledStatusRunId } : {}),
             ...(workspaceChange ? { workspaceChange } : {}),
+            ...executionDecisionActivity,
             _previous: hasFieldChanges ? previous : undefined,
             ...summarizeIssueReferenceActivityDetails(
               updateReferenceDiff
@@ -15315,6 +15459,19 @@ export function issueRoutes(
     res.json(
       await runRedactions.redactForIssue(issue.companyId, issue.id, comments),
     );
+  });
+
+  router.get("/issues/:id/execution-decisions", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(
+      req,
+      res,
+      getIssueById(req, id),
+      "Issue not found",
+    );
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    res.json(await svc.listExecutionDecisions(issue.id));
   });
 
   /** Maps a wake-queue queued-comment mutation error onto the same HTTP error the route threw before this mutation moved into the module. */
@@ -17303,6 +17460,12 @@ export function issueRoutes(
     validate(addIssueCommentSchema),
     async (req, res) => {
       const id = req.params.id as string;
+      // Normalized once: the head the commenter declares for the decision a
+      // review-approval comment records. Any other comment cannot carry it.
+      const commentDecisionHeadSha = req.body.headSha ?? null;
+      if (commentDecisionHeadSha !== null && !isApprovalReviewComment(req.body.body)) {
+        throw headShaWithoutDecision();
+      }
       const issue = await getAccessibleResource(
         req,
         res,
@@ -17311,6 +17474,8 @@ export function issueRoutes(
       );
       if (!issue) return;
       if (issue.conversationAgentId && req.actor.type === "board") {
+        // Conversation messages never record an execution decision.
+        if (commentDecisionHeadSha !== null) throw headShaWithoutDecision();
         if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
         if (!req.actor.userId) throw forbidden("Board user access required");
         if (req.actor.userId !== issue.conversationUserId) throw forbidden("Only the conversation owner can send messages or start a new session");
@@ -17382,6 +17547,32 @@ export function issueRoutes(
         await getClosedIssueExecutionWorkspace(issue);
 
       const actor = getActorInfo(req);
+      // A declared head is only valid when this comment will record a stage
+      // decision. Decide that before any effect (interrupt, reopen, retry
+      // cancellation, status change, activity, comment) so a rejected request
+      // writes nothing. The in-transaction check below stays as the backstop
+      // for a concurrent state change.
+      if (commentDecisionHeadSha !== null) {
+        const preflightState = parseIssueExecutionState(issue.executionState);
+        const willRecordDecision =
+          issue.status === "in_review" &&
+          preflightState?.status === "pending" &&
+          actorMatchesExecutionParticipant(actor, preflightState.currentParticipant ?? null) &&
+          Boolean(
+            applyIssueExecutionPolicyTransition({
+              issue,
+              policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+              requestedStatus: "done",
+              requestedAssigneePatch: {},
+              actor: {
+                agentId: actor.agentId ?? null,
+                userId: actor.actorType === "user" ? actor.actorId : null,
+              },
+              commentBody: req.body.body,
+            }).decision,
+          );
+        if (!willRecordDecision) throw headShaWithoutDecision();
+      }
       const commentPresentation =
         req.body.presentation ??
         (await deriveRecoveryCommentPresentation(
@@ -17664,6 +17855,15 @@ export function issueRoutes(
           currentExecutionState.currentParticipant ?? null,
         ) &&
         isApprovalReviewComment(req.body.body);
+      if (commentDecisionHeadSha !== null && !shouldAutoApproveReviewComment) {
+        throw headShaWithoutDecision();
+      }
+      let commentDecisionActivity: {
+        id: string;
+        stageId: string;
+        outcome: string;
+        headSha: string | null;
+      } | null = null;
 
       // Persist the comment and the auto-approval state transition atomically when both apply.
       // Without a single transaction, a 422 (or any error) thrown by the status update after the
@@ -17671,18 +17871,32 @@ export function issueRoutes(
       let comment: Awaited<ReturnType<typeof svc.addComment>>;
       let goalCommentSteered = false;
       if (shouldAutoApproveReviewComment) {
-        const transition = applyIssueExecutionPolicyTransition({
-          issue: currentIssue,
-          policy: currentExecutionPolicy,
-          requestedStatus: "done",
-          requestedAssigneePatch: {},
-          actor: {
-            agentId: actor.agentId ?? null,
-            userId: actor.actorType === "user" ? actor.actorId : null,
-          },
-          commentBody: req.body.body,
-        });
+        const computeCommentTransition = (base: ExecutionTransitionIssue) =>
+          applyIssueExecutionPolicyTransition({
+            issue: base,
+            policy: normalizeIssueExecutionPolicy(base.executionPolicy ?? null),
+            requestedStatus: "done",
+            requestedAssigneePatch: {},
+            actor: {
+              agentId: actor.agentId ?? null,
+              userId: actor.actorType === "user" ? actor.actorId : null,
+            },
+            commentBody: req.body.body,
+          });
+        const transition = computeCommentTransition(currentIssue);
+        const transitionFingerprint = stageOutcomeFingerprint(transition);
+        if (commentDecisionHeadSha !== null && !transition.decision) {
+          throw headShaWithoutDecision();
+        }
         const decisionId = transition.decision ? randomUUID() : null;
+        if (decisionId && transition.decision) {
+          commentDecisionActivity = {
+            id: decisionId,
+            stageId: transition.decision.stageId,
+            outcome: transition.decision.outcome,
+            headSha: commentDecisionHeadSha,
+          };
+        }
         if (decisionId) {
           const nextExecutionState = transition.patch.executionState;
           if (!nextExecutionState || typeof nextExecutionState !== "object") {
@@ -17693,6 +17907,7 @@ export function issueRoutes(
           transition.patch.executionState = {
             ...nextExecutionState,
             lastDecisionId: decisionId,
+            lastDecisionHeadSha: commentDecisionHeadSha,
           };
         }
 
@@ -17727,6 +17942,32 @@ export function issueRoutes(
         const postCommitIssueActions: IssuePostCommitAction[] = [];
         try {
           txResult = await db.transaction(async (tx) => {
+            if (transition.decision) {
+              const lockedIssue = await svc.getByIdForUpdate(id, tx);
+              if (!lockedIssue || lockedIssue.companyId !== currentIssue.companyId) {
+                throw notFound("Issue not found");
+              }
+              const lockedState = parseIssueExecutionState(lockedIssue.executionState);
+              if (
+                lockedIssue.status !== "in_review" ||
+                lockedState?.status !== "pending" ||
+                !actorMatchesExecutionParticipant(actor, lockedState.currentParticipant ?? null)
+              ) {
+                throw executionStateChanged();
+              }
+              const recomputed = recomputeDecisionUnderLock(transitionFingerprint, () =>
+                computeCommentTransition(lockedIssue),
+              );
+              Object.assign(updatePatch, recomputed.patch, {
+                status:
+                  typeof recomputed.patch.status === "string" ? recomputed.patch.status : "done",
+                executionState: {
+                  ...(recomputed.patch.executionState as Record<string, unknown>),
+                  lastDecisionId: decisionId,
+                  lastDecisionHeadSha: commentDecisionHeadSha,
+                },
+              });
+            }
             const insertedComment = await svc.addComment(
               id,
               req.body.body,
@@ -17773,6 +18014,7 @@ export function issueRoutes(
                 actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: transition.decision.outcome,
                 body: transition.decision.body,
+                headSha: commentDecisionHeadSha,
                 createdByRunId: actor.runId ?? null,
               });
             }
@@ -17793,7 +18035,7 @@ export function issueRoutes(
         currentIssue = txResult.issue;
         // Mirror the normal status-change audit trail: every other in_review -> done path
         // emits an `issue.updated` activity, so emit one here too for the auto-approval path.
-        if (issueBeforeCommentDecision.status !== currentIssue.status) {
+        if (issueBeforeCommentDecision.status !== currentIssue.status || commentDecisionActivity) {
           await logActivity(db, {
             companyId: currentIssue.companyId,
             actorType: actor.actorType,
@@ -17808,6 +18050,7 @@ export function issueRoutes(
               status: currentIssue.status,
               identifier: currentIssue.identifier,
               source: "auto_approval_comment",
+              ...(commentDecisionActivity ? { executionDecision: commentDecisionActivity } : {}),
               _previous: { status: issueBeforeCommentDecision.status },
             },
           });

@@ -53,6 +53,7 @@ import {
   createIssueSchema,
   setIssueTitleSchema,
   updateIssueSchema,
+  issueExecutionDecisionListItemSchema,
   stalledReviewDecisionSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
@@ -4249,6 +4250,24 @@ registry.registerPath({
   summary: "List issue comments",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/execution-decisions",
+  tags: ["issues"],
+  summary: "List every execution decision of an issue, with the declared headSha",
+  description:
+    "Returns every execution decision of the issue, untruncated, ordered by createdAt asc, id asc " +
+    "(an approximate chronology; ties broken by id). The authoritative latest decision is the issue's " +
+    "executionState.lastDecisionId / lastDecisionHeadSha. Same read authorization as GET /api/issues/{id}/comments.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.array(issueExecutionDecisionListItemSchema)),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registry.registerPath({

@@ -717,6 +717,8 @@ export interface IssueExecutionState {
   completedStageIds: string[];
   lastDecisionId: string | null;
   lastDecisionOutcome: IssueExecutionDecisionOutcome | null;
+  /** Commit the actor declared on the last decision; null when that decision carried none. */
+  lastDecisionHeadSha?: string | null;
   monitor?: IssueExecutionMonitorState | null;
   /** Consecutive agent-initiated changes-requested rounds on the current stage. */
   changesRequestedCount?: number;
@@ -732,9 +734,29 @@ export interface IssueExecutionDecision {
   actorUserId: string | null;
   outcome: IssueExecutionDecisionOutcome;
   body: string;
+  /** Commit the deciding actor declared it examined (40 or 64 lowercase hex), or null. */
+  headSha: string | null;
   createdByRunId: string | null;
   createdAt: Date;
   updatedAt: Date;
+}
+
+/**
+ * One row of `GET /api/issues/:id/execution-decisions`. Rows are ordered by
+ * createdAt asc, id asc (an approximate chronology); the authoritative latest
+ * decision is `executionState.lastDecisionId` / `lastDecisionHeadSha`.
+ */
+export interface IssueExecutionDecisionListItem {
+  id: string;
+  stageId: string;
+  stageType: IssueExecutionStageType;
+  outcome: IssueExecutionDecisionOutcome;
+  actorAgentId: string | null;
+  actorUserId: string | null;
+  createdByRunId: string | null;
+  createdAt: Date;
+  /** Declared head: 40 (SHA-1) or 64 (SHA-256) lowercase hex, or null. */
+  headSha: string | null;
 }
 
 export type IssueWatchdogStatus = "active" | "disabled";

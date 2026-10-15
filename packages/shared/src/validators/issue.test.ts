@@ -5,6 +5,7 @@ import {
   issueCommentMetadataSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
+  issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
   stalledReviewDecisionSchema,
@@ -119,6 +120,66 @@ describe("issue validators", () => {
     expect(
       updateIssueSchema.safeParse({ reviewPolicy: "creator_only" }).success,
     ).toBe(false);
+  });
+
+  it("accepts an optional SHA-1 or SHA-256 lowercase hex headSha on every decision-creating body", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const sha256 = "0123456789abcdef".repeat(4);
+    const recovery = { outcome: "restored", sourceIssueStatus: "done" } as const;
+    const bodies = [
+      (headSha?: unknown) => updateIssueSchema.safeParse({ status: "done", comment: "ok", ...(headSha === undefined ? {} : { headSha }) }),
+      (headSha?: unknown) => addIssueCommentSchema.safeParse({ body: "kind: review\ndecision: approved", ...(headSha === undefined ? {} : { headSha }) }),
+      (headSha?: unknown) => resolveIssueRecoveryActionSchema.safeParse({ ...recovery, ...(headSha === undefined ? {} : { headSha }) }),
+    ];
+    for (const parse of bodies) {
+      for (const accepted of [sha, sha256]) {
+        const valid = parse(accepted);
+        expect(valid.success).toBe(true);
+        expect((valid as { data: { headSha?: unknown } }).data.headSha).toBe(accepted);
+      }
+      const omitted = parse();
+      expect(omitted.success).toBe(true);
+      expect((omitted as { data: { headSha?: unknown } }).data.headSha).toBeUndefined();
+      const explicitNull = parse(null);
+      expect(explicitNull.success).toBe(true);
+      expect((explicitNull as { data: { headSha?: unknown } }).data.headSha).toBeNull();
+      for (const malformed of [
+        sha.slice(1),
+        `${sha}0`,
+        sha256.slice(1),
+        `${sha256}0`,
+        sha.toUpperCase(),
+        "g".repeat(40),
+        "",
+        123,
+      ]) {
+        expect(parse(malformed).success).toBe(false);
+      }
+    }
+  });
+
+  it("reads lastDecisionHeadSha as null on execution states written before it existed", () => {
+    const legacy = {
+      status: "pending",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    };
+    expect(issueExecutionStateSchema.parse(legacy).lastDecisionHeadSha).toBeNull();
+    const sha = "a".repeat(40);
+    expect(issueExecutionStateSchema.parse({ ...legacy, lastDecisionHeadSha: sha }).lastDecisionHeadSha).toBe(sha);
+    // A malformed stored value degrades to null instead of invalidating the whole state.
+    for (const malformed of ["A".repeat(40), "not-a-sha", 42]) {
+      const parsed = issueExecutionStateSchema.safeParse({ ...legacy, lastDecisionId: null, lastDecisionHeadSha: malformed });
+      expect(parsed.success).toBe(true);
+      expect(parsed.data?.lastDecisionHeadSha).toBeNull();
+      expect(parsed.data?.status).toBe("pending");
+    }
   });
 
   it("accepts only UUID review interaction bindings on update", () => {

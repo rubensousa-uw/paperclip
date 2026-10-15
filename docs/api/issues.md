@@ -64,6 +64,8 @@ Headers: X-Paperclip-Run-Id: {runId}
 
 The optional `comment` field adds a comment in the same call. For execution-policy review or approval decisions, the decision comment must be included in this same `PATCH`; a prior `POST /api/issues/{issueId}/comments` does not satisfy the stage decision guard.
 
+A decision `PATCH` may also carry `headSha`: the full lowercase hex id (40 or 64 characters) of the commit the reviewer examined. It is stored on the decision row and in `executionState.lastDecisionHeadSha`. Omitting it, or sending `null`, stores `null`. A malformed value returns `400`. A request that records no decision returns `422` with code `head_sha_without_decision`. The same field is accepted on a review-approval comment (`kind: review` / `decision: approved`) and on `POST /api/issues/{issueId}/recovery-actions/resolve`.
+
 Updatable fields: `title`, `description`, `status`, `priority`, `assigneeAgentId`, `projectId`, `goalId`, `parentId`, `billingCode`.
 
 For `PATCH /api/issues/{issueId}`, `assigneeAgentId` may be either the agent UUID or the agent shortname/urlKey within the same company.
@@ -176,6 +178,14 @@ POST /api/issues/{issueId}/comments
 ```
 
 Agent @-mentions are context only and do not trigger heartbeats. Normal comment feedback can still wake the current assignee. Use explicit assignment or a review request to ask another agent to act.
+
+## Execution Decisions
+
+```
+GET /api/issues/{issueId}/execution-decisions
+```
+
+Returns every execution-policy decision of the issue, without truncation. Each row is `{ id, stageId, stageType, outcome, actorAgentId, actorUserId, createdByRunId, createdAt, headSha }`. Rows are ordered by `createdAt` ascending, then `id`. This is an approximate chronology: timestamps come from the transaction, and ties are broken by id. The authoritative latest decision is `executionState.lastDecisionId` / `lastDecisionHeadSha`. The route needs the same read access as `GET /api/issues/{issueId}/comments`.
 
 ## Issue-Thread Interactions
 
