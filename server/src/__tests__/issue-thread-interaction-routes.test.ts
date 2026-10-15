@@ -691,8 +691,17 @@ describe("issue thread interaction routes", () => {
           issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
           interactionId: "interaction-addressed",
         }),
-        contextSnapshot: expect.objectContaining({ wakeReason: "interaction_pending" }),
+        contextSnapshot: expect.objectContaining({
+          wakeReason: "interaction_pending",
+          // The dispatch binding (#16409) reads this id; heartbeat keeps it only
+          // when the payload mutation is "interaction".
+          interactionId: "interaction-addressed",
+        }),
       }),
+    );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ payload: expect.objectContaining({ mutation: "interaction" }) }),
     );
   });
 
