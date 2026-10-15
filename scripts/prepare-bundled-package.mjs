@@ -9,7 +9,18 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const nativeTargets = ["linux-x64", "darwin-arm64", "darwin-x64"];
 
-export function materializePublishManifest(pkg) {
+// Lifecycle scripts that would rebuild a staged package from the workspace.
+// The checkout is fully built before staging, and a staged directory has no
+// workspace, so `npm pack` of a staged package must not run them (#15026).
+const STAGED_LIFECYCLE_SCRIPTS = ["prepack", "postpack", "prepare", "prepublishOnly"];
+
+/**
+ * `workspaceVersion(name)` returns a workspace dependency's own version. A
+ * release bumps every package together, so the default (the dependent's own
+ * version) holds there; a git-ref install keeps the checked-in versions, which
+ * differ between packages (#15026).
+ */
+export function materializePublishManifest(pkg, { workspaceVersion } = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -24,7 +35,7 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        return [name, `${prefix}${workspaceVersion?.(name) ?? pkg.version}`];
       }),
     );
   }
@@ -354,6 +365,23 @@ export function applyBundledDependencyPatches(destinationDir, bundledDependencie
   }
 }
 
+/** Drops the lifecycle scripts a staged package must not run (in place). */
+export function stripStagedLifecycleScripts(manifest) {
+  if (!manifest.scripts) return manifest;
+  const scripts = { ...manifest.scripts };
+  for (const name of STAGED_LIFECYCLE_SCRIPTS) delete scripts[name];
+  manifest.scripts = scripts;
+  return manifest;
+}
+
+/** The version of a workspace dependency as linked into `sourceDir`, or null. */
+export function linkedWorkspaceVersion(sourceDir, name) {
+  const linkedManifestPath = resolve(sourceDir, "node_modules", name, "package.json");
+  if (!existsSync(linkedManifestPath)) return null;
+  const version = JSON.parse(readFileSync(linkedManifestPath, "utf8")).version;
+  return typeof version === "string" && version.length > 0 ? version : null;
+}
+
 export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot } = {}) {
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
@@ -374,7 +402,10 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const publishManifest = materializePublishManifest(sourcePackage, {
+    workspaceVersion: (name) => linkedWorkspaceVersion(sourceDir, name),
+  });
+  stripStagedLifecycleScripts(publishManifest);
   const rootPackage = JSON.parse(readFileSync(resolve(sourceRoot, "package.json"), "utf8"));
   const profileData = bundledDependencies.includes("@agentclientprotocol/codex-acp")
     ? JSON.parse(readFileSync(resolve(sourceRoot, "packages/paperclip-runner/acpx-profiles.json"), "utf8")) : undefined;
