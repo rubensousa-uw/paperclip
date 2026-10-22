@@ -588,6 +588,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const { runId, agent, runtime, config, context, onLog, onMeta, onEvent, onSpawn, authToken } = ctx;
+  const executionTarget = readAdapterExecutionTarget({
+    executionTarget: ctx.executionTarget,
+    legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
+  });
+  const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+  const networkScope = parseLocalProcessNetworkScope(config.networkScope);
+  if (adapterExecutionTargetIsRemote(executionTarget) && (filesystemScope || networkScope)) {
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "codex_remote_confinement_unsupported",
+      errorMessage: "Filesystem/network confinement is not supported on this remote Codex execution target.",
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
+    };
+  }
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -624,10 +642,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       )
     : [];
   const runtimePrimaryUrl = asString(context.paperclipRuntimePrimaryUrl, "");
-  const executionTarget = readAdapterExecutionTarget({
-    executionTarget: ctx.executionTarget,
-    legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
-  });
   const targetWorkspaceRealization = executionTarget?.workspaceRealization ?? null;
   const configuredCwd = asString(config.cwd, "");
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
@@ -994,8 +1008,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ),
     );
     const billingType = resolveCodexBillingType(effectiveEnv);
-    const networkScope = parseLocalProcessNetworkScope(config.networkScope);
-    const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
     const localProcessSandbox: LocalProcessSandboxOptions | null =
       (filesystemScope || networkScope) && !executionTargetIsRemote
         ? {
