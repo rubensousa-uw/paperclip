@@ -617,78 +617,143 @@ describe("remote proxy script is an explicit template", () => {
  * denial; any other answer (200, 502 when the upstream is unreachable) means the policy allowed it.
  */
 describe("allowlist parity between the local matcher and the remote proxy", () => {
-  const POLICY = {
-    networkAllowlist: ["api.example.test", "exact.example.test:8443", "default.example.test:443"],
-    networkTrustedUrls: ["http://127.0.0.1:4310/api"],
-  };
-  type Request = { form: "connect" | "absolute"; host: string; port: string; expected: "allow" | "deny" };
-  const MATRIX: Request[] = [
-    { form: "connect", host: "api.example.test", port: "443", expected: "allow" },
-    { form: "connect", host: "api.example.test", port: "8443", expected: "allow" },
-    { form: "connect", host: "API.EXAMPLE.TEST", port: "443", expected: "allow" },
-    { form: "connect", host: "exact.example.test", port: "8443", expected: "allow" },
-    { form: "connect", host: "exact.example.test", port: "443", expected: "deny" },
-    { form: "connect", host: "default.example.test", port: "443", expected: "allow" },
-    { form: "connect", host: "default.example.test", port: "8443", expected: "deny" },
-    { form: "connect", host: "other.example.test", port: "443", expected: "deny" },
-    { form: "connect", host: "sub.api.example.test", port: "443", expected: "deny" },
-    { form: "connect", host: "127.0.0.1", port: "4310", expected: "allow" },
-    { form: "connect", host: "127.0.0.1", port: "4311", expected: "deny" },
-    { form: "absolute", host: "api.example.test", port: "80", expected: "allow" },
-    { form: "absolute", host: "exact.example.test", port: "8443", expected: "allow" },
-    { form: "absolute", host: "exact.example.test", port: "80", expected: "deny" },
-    { form: "absolute", host: "127.0.0.1", port: "4310", expected: "allow" },
-    { form: "absolute", host: "other.example.test", port: "80", expected: "deny" },
-  ];
+  // Re-review of 3954d0600, decision 3: each row needs a valid HTTP answer — 403
+  // `network_target_denied` for deny, the upstream's marker body for allow. Timeouts, empty
+  // answers and socket errors fail the test. Allowed rows therefore point at local upstreams;
+  // denied rows are refused before any connection.
+  const MARKER = "PAPERCLIP-PARITY-ALLOW-MARKER";
+  type Row = { form: "connect" | "absolute"; host: string; port: string; expected: "allow" | "deny" };
 
-  it("the local matcher decides the matrix", () => {
+  async function startUpstream(): Promise<{ port: number; close: () => Promise<void> }> {
+    const server = http.createServer((_request, response) => {
+      response.writeHead(200, { "Content-Type": "text/plain", Connection: "close" });
+      response.end(MARKER);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    return {
+      port: (server.address() as net.AddressInfo).port,
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  function matrix(listed: number, trusted: number, closed: number) {
+    const policy = {
+      networkAllowlist: ["localhost", `127.0.0.1:${listed}`, "127.0.0.2:443", "exact.example.test:8443"],
+      networkTrustedUrls: [`http://127.0.0.1:${trusted}/api`],
+    };
+    const rows: Row[] = [
+      { form: "connect", host: "localhost", port: String(listed), expected: "allow" },
+      { form: "connect", host: "LOCALHOST", port: String(trusted), expected: "allow" },
+      { form: "connect", host: "127.0.0.1", port: String(listed), expected: "allow" },
+      { form: "connect", host: "127.0.0.1", port: String(trusted), expected: "allow" },
+      { form: "connect", host: "127.0.0.1", port: String(closed), expected: "deny" },
+      { form: "connect", host: "127.0.0.2", port: String(listed), expected: "deny" },
+      { form: "connect", host: "exact.example.test", port: "443", expected: "deny" },
+      { form: "connect", host: "other.example.test", port: "443", expected: "deny" },
+      { form: "connect", host: "sub.localhost.example.test", port: String(listed), expected: "deny" },
+      { form: "absolute", host: "localhost", port: String(listed), expected: "allow" },
+      { form: "absolute", host: "127.0.0.1", port: String(trusted), expected: "allow" },
+      { form: "absolute", host: "127.0.0.1", port: String(closed), expected: "deny" },
+      { form: "absolute", host: "exact.example.test", port: "80", expected: "deny" },
+      { form: "absolute", host: "other.example.test", port: "80", expected: "deny" },
+    ];
+    return { policy, rows };
+  }
+
+  async function freePort(): Promise<number> {
+    const server = net.createServer();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const port = (server.address() as net.AddressInfo).port;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    return port;
+  }
+
+  function ask(socketPath: string, row: Row): Promise<"allow" | "deny"> {
+    return new Promise((resolve, reject) => {
+      const socket = net.connect(socketPath);
+      let received = "";
+      let tunnelled = false;
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error(`timeout for ${JSON.stringify(row)}; received ${JSON.stringify(received)}`));
+      }, 3000);
+      const settle = () => {
+        if (/^HTTP\/1\.1 403/.test(received) && received.includes("network_target_denied")) {
+          clearTimeout(timer); socket.destroy(); resolve("deny"); return true;
+        }
+        if (received.includes(MARKER)) {
+          clearTimeout(timer); socket.destroy(); resolve("allow"); return true;
+        }
+        return false;
+      };
+      socket.on("data", (chunk) => {
+        received += chunk.toString("utf8");
+        if (settle()) return;
+        if (row.form === "connect" && !tunnelled && /^HTTP\/1\.1 200/.test(received) && received.includes("\r\n\r\n")) {
+          tunnelled = true;
+          received = "";
+          socket.write(`GET /api/x HTTP/1.1\r\nHost: ${row.host}:${row.port}\r\nConnection: close\r\n\r\n`);
+        }
+      });
+      socket.on("error", (error) => { clearTimeout(timer); reject(error); });
+      socket.on("close", () => {
+        if (!settle()) {
+          clearTimeout(timer);
+          reject(new Error(`no valid answer for ${JSON.stringify(row)}: ${JSON.stringify(received)}`));
+        }
+      });
+      socket.write(row.form === "connect"
+        ? `CONNECT ${row.host}:${row.port} HTTP/1.1\r\nHost: ${row.host}:${row.port}\r\n\r\n`
+        : `GET http://${row.host}${row.port === "80" ? "" : `:${row.port}`}/api/x HTTP/1.1\r\n`
+          + `Host: ${row.host}\r\nConnection: close\r\n\r\n`);
+    });
+  }
+
+  it("the local matcher decides the matrix", async () => {
     const local = (sandboxModule as Record<string, unknown>).isNetworkTargetAllowedByPolicy as
-      | ((policy: typeof POLICY, hostname: string, port: string) => boolean)
+      | ((policy: { networkAllowlist: string[]; networkTrustedUrls: string[] }, hostname: string, port: string) => boolean)
       | undefined;
     expect(typeof local).toBe("function");
-    for (const request of MATRIX) {
-      expect({ request, decision: local!(POLICY, request.host.toLowerCase(), request.port) ? "allow" : "deny" })
-        .toEqual({ request, decision: request.expected });
+    const { policy, rows } = matrix(41001, 41002, 41003);
+    for (const row of rows) {
+      expect({ row, decision: local!(policy, row.host.toLowerCase(), row.port) ? "allow" : "deny" })
+        .toEqual({ row, decision: row.expected });
     }
   });
 
-  it.runIf(process.platform === "linux")("the remote proxy decides the same matrix", async () => {
+  it.runIf(process.platform === "linux")("the remote proxy gives a valid answer for every row", async () => {
     const build = (sandboxModule as Record<string, unknown>).buildRemoteNetworkAllowlistProxyScript as
       (input: { networkAllowlist: string[]; networkTrustedUrls?: string[] }) => string;
+    const listed = await startUpstream();
+    const trusted = await startUpstream();
+    const closed = await freePort();
+    const { policy, rows } = matrix(listed.port, trusted.port, closed);
     const dir = await fs.mkdtemp(path.join("/tmp", "pcp-parity-"));
     cleanup.push(dir);
     const scriptPath = path.join(dir, "proxy.mjs");
     const socketPath = path.join(dir, "proxy.sock");
-    await fs.writeFile(scriptPath, build(POLICY), "utf8");
+    await fs.writeFile(scriptPath, build(policy), "utf8");
     const child = spawn(process.execPath, [scriptPath, socketPath], { stdio: "ignore" });
     try {
       for (let attempt = 0; attempt < 100; attempt += 1) {
         if (await fs.stat(socketPath).then(() => true, () => false)) break;
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      for (const request of MATRIX) {
-        const head = request.form === "connect"
-          ? `CONNECT ${request.host}:${request.port} HTTP/1.1\r\nHost: ${request.host}:${request.port}\r\n\r\n`
-          : `GET http://${request.host}${request.port === "80" ? "" : `:${request.port}`}/api/x HTTP/1.1\r\n`
-            + `Host: ${request.host}\r\nConnection: close\r\n\r\n`;
-        const response = await new Promise<string>((resolve) => {
-          const socket = net.connect(socketPath);
-          let received = "";
-          const done = () => { socket.destroy(); resolve(received); };
-          socket.on("data", (chunk) => {
-            received += chunk.toString("utf8");
-            if (received.includes("\r\n")) done();
-          });
-          socket.on("error", done);
-          socket.on("close", done);
-          setTimeout(done, 1500);
-          socket.write(head);
-        });
-        const decision = /^HTTP\/1\.1 403/.test(response) ? "deny" : "allow";
-        expect({ request, decision }).toEqual({ request, decision: request.expected });
+      for (const row of rows) {
+        expect({ row, decision: await ask(socketPath, row) }).toEqual({ row, decision: row.expected });
+      }
+      const local = (sandboxModule as Record<string, unknown>).isNetworkTargetAllowedByPolicy as
+        ((p: typeof policy, hostname: string, port: string) => boolean) | undefined;
+      if (local) {
+        for (const row of rows) {
+          expect({ row, local: local(policy, row.host.toLowerCase(), row.port) ? "allow" : "deny" })
+            .toEqual({ row, local: row.expected });
+        }
       }
     } finally {
       child.kill("SIGKILL");
+      await listed.close();
+      await trusted.close();
     }
   }, 60_000);
 });

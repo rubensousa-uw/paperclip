@@ -262,7 +262,10 @@ describe("remote setup refuses login-profile aliases into writable paths", () =>
     return String(mocks.runSshCommand.mock.calls[0]?.[1] ?? "");
   }
 
-  async function runSetup(alias: { file: string; into: "workspace" | "codexHome" | null }) {
+  async function runSetup(
+    alias: { file: string; into: "workspace" | "codexHome" | null },
+    extra?: (dirs: { root: string; home: string; workspace: string; codexHome: string }) => Promise<void>,
+  ) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "pcp-alias-"));
     try {
       const home = path.join(root, "home");
@@ -286,6 +289,7 @@ describe("remote setup refuses login-profile aliases into writable paths", () =>
         await fs.rm(path.join(home, alias.file), { force: true });
         await fs.symlink(target, path.join(home, alias.file));
       }
+      await extra?.({ root, home, workspace, codexHome });
       const script = await setupScriptFor(workspace, codexHome);
       expect(script.length).toBeGreaterThan(0);
       const outcome = await new Promise<{ code: number; stderr: string }>((resolve) => {
@@ -323,12 +327,117 @@ describe("remote setup refuses login-profile aliases into writable paths", () =>
     });
   }
 
+  // Re-review of 3954d0600, decision 2: refuse when ANY hop of the chain is under a writable
+  // path, not only the final target.
+  it.runIf(process.platform === "linux")("refuses ~/.bashrc -> workspace/link -> safe file outside", async () => {
+    const { code, nodeCalls } = await runSetup({ file: ".bashrc", into: null }, async ({ root, home, workspace }) => {
+      const safe = path.join(root, "safe", "bashrc");
+      await fs.mkdir(path.dirname(safe), { recursive: true });
+      await fs.writeFile(safe, "# read-only target outside the sandbox\n");
+      await fs.symlink(safe, path.join(workspace, "link"));
+      await fs.rm(path.join(home, ".bashrc"), { force: true });
+      await fs.symlink(path.join(workspace, "link"), path.join(home, ".bashrc"));
+    });
+    expect(code).not.toBe(0);
+    expect(nodeCalls).toBe("");
+  });
+
+  it.runIf(process.platform === "linux")("refuses a two-hop chain through CODEX_HOME", async () => {
+    const { code, nodeCalls } = await runSetup({ file: ".profile", into: null }, async ({ root, home, codexHome }) => {
+      const safe = path.join(root, "safe", "profile");
+      await fs.mkdir(path.dirname(safe), { recursive: true });
+      await fs.writeFile(safe, "# safe\n");
+      const outside = path.join(root, "hop");
+      await fs.symlink(path.join(codexHome, "hop2"), outside);
+      await fs.symlink(safe, path.join(codexHome, "hop2"));
+      await fs.rm(path.join(home, ".profile"), { force: true });
+      await fs.symlink(outside, path.join(home, ".profile"));
+    });
+    expect(code).not.toBe(0);
+    expect(nodeCalls).toBe("");
+  });
+
+  it.runIf(process.platform === "linux")("accepts a chain that never touches a writable path (control)", async () => {
+    const { nodeCalls } = await runSetup({ file: ".bashrc", into: null }, async ({ root, home }) => {
+      const safe = path.join(root, "safe", "bashrc");
+      await fs.mkdir(path.dirname(safe), { recursive: true });
+      await fs.writeFile(safe, "# safe\n");
+      await fs.symlink(safe, path.join(root, "hop"));
+      await fs.rm(path.join(home, ".bashrc"), { force: true });
+      await fs.symlink(path.join(root, "hop"), path.join(home, ".bashrc"));
+    });
+    expect(nodeCalls).not.toBe("");
+  });
+
+  // Re-review of 3954d0600, decision 1: the read-only re-bind only protects a regular file.
+  it.runIf(process.platform === "linux")("refuses when the workspace .git/config is a symlink", async () => {
+    const { code, nodeCalls } = await runSetup({ file: ".bashrc", into: null }, async ({ root, workspace }) => {
+      await fs.mkdir(path.join(workspace, ".git", "hooks"), { recursive: true });
+      const elsewhere = path.join(root, "elsewhere-config");
+      await fs.writeFile(elsewhere, "[core]\n");
+      await fs.symlink(elsewhere, path.join(workspace, ".git", "config"));
+    });
+    expect(code).not.toBe(0);
+    expect(nodeCalls).toBe("");
+  });
+
+  it.runIf(process.platform === "linux")("accepts a regular .git/config (control)", async () => {
+    const { nodeCalls } = await runSetup({ file: ".bashrc", into: null }, async ({ workspace }) => {
+      await fs.mkdir(path.join(workspace, ".git", "hooks"), { recursive: true });
+      await fs.writeFile(path.join(workspace, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+    });
+    expect(nodeCalls).not.toBe("");
+  });
+
   it("canonicalises the protected files", async () => {
     const script = await setupScriptFor("/home/factory/workspaces/run-1",
       "/home/factory/workspaces/run-1/.paperclip-runtime/codex/home");
     expect(script).toMatch(/realpath|readlink -f/);
     for (const name of ["/etc/profile", "/etc/profile.d", ".profile", ".bash_profile", ".bashrc", ".zprofile", ".ssh"]) {
       expect(script).toContain(name);
+    }
+  });
+});
+
+/**
+ * Re-review of 3954d0600, decision 1: inside the remote sandbox the workspace's `.git/config`,
+ * `.git/hooks` and `.git/config.worktree` (if present) are re-bound read-only AFTER the workspace
+ * rw bind, so the agent cannot add `filter.*`, `include.path` or hooks that host-side git
+ * (`ssh.ts:806` checkout/reset) would execute. `.git` objects/refs stay writable (agents commit).
+ */
+describe("remote sandbox keeps the repo config immutable", () => {
+  const build = () => buildRemoteNetworkSandboxSpawnTarget({
+    executable: "codex",
+    args: ["exec", "-"],
+    cwd: WORKSPACE,
+    runtimeDir: "/tmp/pcp-net-fixture",
+    options: SANDBOX_OPTIONS,
+  });
+
+  function indexOfBind(args: string[], flags: string[], dest: string): number {
+    for (let i = 0; i < args.length; i += 1) {
+      if (args[i] === "--") break;
+      if (flags.includes(args[i]) && path.posix.resolve(args[i + 2] ?? "") === dest) return i;
+    }
+    return -1;
+  }
+
+  it("re-binds .git/config, .git/hooks and .git/config.worktree read-only after the workspace bind", () => {
+    const { args } = build();
+    const workspaceBind = indexOfBind(args, ["--bind", "--bind-try"], WORKSPACE);
+    expect(workspaceBind).toBeGreaterThanOrEqual(0);
+    for (const dest of [`${WORKSPACE}/.git/config`, `${WORKSPACE}/.git/hooks`, `${WORKSPACE}/.git/config.worktree`]) {
+      const ro = indexOfBind(args, ["--ro-bind", "--ro-bind-try"], dest);
+      expect({ dest, after: ro > workspaceBind }).toEqual({ dest, after: true });
+    }
+  });
+
+  it("leaves objects and refs writable but config and hooks read-only", () => {
+    const { args } = build();
+    expect(writable(args, `${WORKSPACE}/.git/objects/ab/cdef`)).toBe(true);
+    expect(writable(args, `${WORKSPACE}/.git/refs/heads/main`)).toBe(true);
+    for (const file of [".git/config", ".git/hooks/post-checkout", ".git/hooks/pre-commit", ".git/config.worktree"]) {
+      expect({ file, writable: writable(args, `${WORKSPACE}/${file}`) }).toEqual({ file, writable: false });
     }
   });
 });
