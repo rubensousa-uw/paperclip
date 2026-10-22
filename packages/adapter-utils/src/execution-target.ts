@@ -88,7 +88,11 @@ import {
   type StartupSpanContext,
 } from "./acpx-engine/startup-timing.js";
 import type { RuntimeProgressSink, RuntimeStatusSink } from "./runtime-progress.js";
-import type { LocalProcessSandboxOptions } from "./local-process-sandbox.js";
+import {
+  buildRemoteNetworkSandboxSpawnTarget,
+  type LocalProcessSandboxOptions,
+  type LocalProcessSandboxSpawnTarget,
+} from "./local-process-sandbox.js";
 import type { RunnerIngressEndpoint } from "./runner-connectivity.js";
 
 export type { RuntimeProgressSink } from "./runtime-progress.js";
@@ -852,6 +856,78 @@ function applyRunDispositionSeam(
   };
 }
 
+async function prepareSshNetworkSandboxSpawnTarget(input: {
+  target: AdapterSshExecutionTarget;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  options: LocalProcessSandboxOptions;
+}): Promise<LocalProcessSandboxSpawnTarget> {
+  const runtimeDir = `/tmp/pcp-net-${randomUUID()}`;
+  const sandbox = buildRemoteNetworkSandboxSpawnTarget({
+    executable: input.command,
+    args: input.args,
+    cwd: input.target.remoteCwd,
+    runtimeDir,
+    options: input.options,
+  });
+  const quotedDir = shellQuote(runtimeDir);
+  const cleanupCommand = [
+    `if [ -f ${quotedDir}/proxy.pid ]; then kill "$(cat ${quotedDir}/proxy.pid)" 2>/dev/null || true; fi`,
+    `rm -rf -- ${quotedDir}`,
+  ].join("\n");
+  const scripts = Object.entries(sandbox.files);
+  const setup = [
+    "set -eu",
+    '[ "$(uname -s)" = Linux ] || { echo "Remote process confinement requires Linux." >&2; exit 1; }',
+    `command -v ${shellQuote(sandbox.command)} >/dev/null || { echo "Remote process confinement requires Bubblewrap." >&2; exit 1; }`,
+  ];
+  if (scripts.length > 0) {
+    const writeFiles = [
+      'const fs = require("node:fs");',
+      `fs.mkdirSync(${JSON.stringify(runtimeDir)}, { mode: 0o700 });`,
+      ...scripts.map(([name, source]) =>
+        `fs.writeFileSync(${JSON.stringify(path.posix.join(runtimeDir, name))}, ${JSON.stringify(source)}, { mode: 0o500 });`),
+    ].join("\n");
+    const waitForProxy = `
+const fs = require("node:fs");
+const socketPath = ${JSON.stringify(path.posix.join(runtimeDir, "proxy.sock"))};
+let attempts = 0;
+const timer = setInterval(() => {
+  if (fs.existsSync(socketPath)) { clearInterval(timer); return; }
+  if (++attempts >= 100) {
+    console.error("Remote Paperclip network proxy failed to start.");
+    process.exit(1);
+  }
+}, 50);
+`;
+    setup.push(
+      'command -v node >/dev/null || { echo "Remote allowlist confinement requires Node.js." >&2; exit 1; }',
+      `node -e ${shellQuote(writeFiles)}`,
+      `node ${quotedDir}/proxy.mjs ${quotedDir}/proxy.sock >${quotedDir}/proxy.log 2>&1 </dev/null &`,
+      `echo $! >${quotedDir}/proxy.pid`,
+      `node -e ${shellQuote(waitForProxy)}`,
+    );
+  }
+  try {
+    await runSshCommand(input.target.spec, setup.join("\n"), { env: input.env, timeoutMs: 15_000 });
+  } catch (error) {
+    if (scripts.length > 0) {
+      await runSshCommand(input.target.spec, cleanupCommand, { env: input.env, timeoutMs: 15_000 })
+        .catch(() => undefined);
+    }
+    throw error;
+  }
+  return {
+    ...sandbox,
+    cleanup: scripts.length > 0
+      ? async () => {
+          await runSshCommand(input.target.spec, cleanupCommand, { env: input.env, timeoutMs: 15_000 });
+        }
+      : undefined,
+  };
+}
+
 export async function runAdapterExecutionTargetProcess(
   runId: string,
   target: AdapterExecutionTarget | null | undefined,
@@ -913,18 +989,34 @@ export async function runAdapterExecutionTargetProcess(
       ? sanitizeRemoteExecutionEnv(options.env)
       : options.env;
 
-  const result = await runChildProcess(runId, command, args, {
-    cwd: options.cwd,
-    env,
-    stdin: options.stdin,
-    timeoutSec: options.timeoutSec,
-    graceSec: options.graceSec,
-    onLog: options.onLog,
-    onSpawn: options.onSpawn,
-    terminalResultCleanup: options.terminalResultCleanup,
-    localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
-    remoteExecution: adapterExecutionTargetToRemoteSpec(target),
-  });
+  const sshNetworkSandbox = target?.kind === "remote" && target.transport === "ssh" && options.localProcessSandbox
+    ? await prepareSshNetworkSandboxSpawnTarget({
+        target,
+        command,
+        args,
+        env,
+        options: options.localProcessSandbox,
+      })
+    : null;
+  let result: RunProcessResult;
+  try {
+    result = await runChildProcess(runId, sshNetworkSandbox?.command ?? command, sshNetworkSandbox?.args ?? args, {
+      cwd: options.cwd,
+      env,
+      stdin: options.stdin,
+      timeoutSec: options.timeoutSec,
+      graceSec: options.graceSec,
+      onLog: options.onLog,
+      onSpawn: options.onSpawn,
+      terminalResultCleanup: options.terminalResultCleanup,
+      localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
+      remoteExecution: adapterExecutionTargetToRemoteSpec(target),
+    });
+  } finally {
+    await sshNetworkSandbox?.cleanup?.().catch(async (error) => {
+      await options.onLog("stderr", `[paperclip] Failed to clean up remote network sandbox: ${String(error)}\n`);
+    });
+  }
   // Closing an SSH client on timeout/disconnect does not prove the remote
   // provider exited. SSH status 255 is transport failure, never a stop receipt.
   if (!target || target.kind === "local" ||

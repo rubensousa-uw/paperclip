@@ -67,6 +67,7 @@ const SYSTEM_READ_PATHS = [
 ] as const;
 
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] as const;
+const BWRAP_BASE_ARGS = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts"];
 const SANDBOX_PROXY_PORT = 31_337;
 const UNIX_SOCKET_PATH_MAX_BYTES = 107;
 const NETWORK_PROXY_TEMP_PREFIX = "paperclip-network-sandbox-";
@@ -242,7 +243,17 @@ async function startNetworkAllowlistProxy(
       'networkScope="allowlist" requires at least one valid networkAllowlist hostname or HTTP(S) networkTrustedUrl.',
     );
   }
-  const server = http.createServer((request, response) => {
+  return await listenNetworkAllowlistProxy(http, net, rules, socketPath);
+}
+
+// Keep the proxy implementation self-contained so SSH targets use the same policy and protocol.
+async function listenNetworkAllowlistProxy(
+  httpModule: typeof http,
+  netModule: typeof net,
+  rules: NetworkAllowlistRule[],
+  socketPath: string,
+): Promise<NetworkAllowlistProxy> {
+  const server = httpModule.createServer((request, response) => {
     let target: URL;
     try {
       target = new URL(request.url ?? "");
@@ -259,7 +270,7 @@ async function startNetworkAllowlistProxy(
       writeProxyError(response, 403, "network_target_denied", "Network target denied by Paperclip sandbox policy.");
       return;
     }
-    const upstream = http.request(target, {
+    const upstream = httpModule.request(target, {
       method: request.method,
       headers: { ...request.headers, host: target.host },
     }, (upstreamResponse) => {
@@ -280,7 +291,7 @@ async function startNetworkAllowlistProxy(
       ));
       return;
     }
-    const upstream = net.connect(Number(port), hostname, () => {
+    const upstream = netModule.connect(Number(port), hostname, () => {
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length > 0) upstream.write(head);
       upstream.pipe(clientSocket);
@@ -309,13 +320,38 @@ async function startNetworkAllowlistProxy(
   };
 }
 
-async function createNetworkProxyBridge(): Promise<string> {
+export function buildRemoteNetworkAllowlistProxyScript(input: {
+  networkAllowlist: string[];
+  networkTrustedUrls?: string[];
+}): string {
+  const rules = [
+    ...input.networkAllowlist.map(parseNetworkAllowlistEntry),
+    ...(input.networkTrustedUrls ?? []).map(parseTrustedNetworkUrl)
+      .filter((rule): rule is NetworkAllowlistRule => rule !== null),
+  ];
+  if (rules.length === 0) {
+    throw new Error(
+      'networkScope="allowlist" requires at least one valid networkAllowlist hostname or HTTP(S) networkTrustedUrl.',
+    );
+  }
+  return [
+    'import http from "node:http";',
+    'import net from "node:net";',
+    isNetworkTargetAllowed.toString(),
+    writeProxyError.toString(),
+    connectProxyError.toString(),
+    listenNetworkAllowlistProxy.toString(),
+    `await listenNetworkAllowlistProxy(http, net, ${JSON.stringify(rules)}, process.argv[2]);`,
+  ].join("\n");
+}
+
+function createNetworkProxyBridge(input?: { socketPath: string; executable: string }): string {
   const source = `
 const net = require("node:net");
 const { spawn } = require("node:child_process");
-const socketPath = process.argv[2];
-const executable = process.argv[3];
-const args = process.argv.slice(4);
+const socketPath = ${input ? JSON.stringify(input.socketPath) : "process.argv[2]"};
+const executable = ${input ? JSON.stringify(input.executable) : "process.argv[3]"};
+const args = process.argv.slice(${input ? 2 : 4});
 const server = net.createServer((client) => {
   const upstream = net.connect(socketPath);
   client.pipe(upstream);
@@ -336,6 +372,63 @@ server.listen(${SANDBOX_PROXY_PORT}, "127.0.0.1", () => {
 });
 `;
   return source.trimStart();
+}
+
+function sandboxNetworkEnv(networkScope: LocalProcessNetworkScope | null): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  if (networkScope) {
+    for (const key of PROXY_ENV_KEYS) env[key] = undefined;
+    env.NO_PROXY = "";
+    env.no_proxy = "";
+  }
+  if (networkScope === "allowlist") {
+    const proxyUrl = `http://127.0.0.1:${SANDBOX_PROXY_PORT}`;
+    env.HTTP_PROXY = proxyUrl;
+    env.HTTPS_PROXY = proxyUrl;
+    env.http_proxy = proxyUrl;
+    env.https_proxy = proxyUrl;
+  }
+
+  return env;
+}
+
+export function buildRemoteNetworkSandboxSpawnTarget(input: {
+  executable: string;
+  args: string[];
+  cwd: string;
+  runtimeDir: string;
+  options: LocalProcessSandboxOptions;
+}): LocalProcessSandboxSpawnTarget & { files: Record<string, string> } {
+  if (input.options.filesystemScope || !input.options.networkScope) {
+    throw new Error("Remote process confinement supports only a network scope.");
+  }
+  if (!path.posix.isAbsolute(input.cwd) || !path.posix.isAbsolute(input.runtimeDir)) {
+    throw new Error("Remote sandbox cwd and runtimeDir must be absolute POSIX paths.");
+  }
+  const cwd = path.posix.resolve(input.cwd);
+  const runtimeDir = path.posix.resolve(input.runtimeDir);
+  const args = [...BWRAP_BASE_ARGS, "--bind", "/", "/", "--unshare-net"];
+  for (const [key, value] of Object.entries(sandboxNetworkEnv(input.options.networkScope))) {
+    args.push(...(value === undefined ? ["--unsetenv", key] : ["--setenv", key, value]));
+  }
+  const files: Record<string, string> = {};
+  let executable = input.executable;
+  if (input.options.networkScope === "allowlist") {
+    const socketPath = path.posix.join(runtimeDir, "proxy.sock");
+    assertUnixSocketPathLength(socketPath);
+    executable = path.posix.join(runtimeDir, path.posix.basename(input.executable));
+    files["proxy.mjs"] = buildRemoteNetworkAllowlistProxyScript({
+      networkAllowlist: input.options.networkAllowlist ?? [],
+      networkTrustedUrls: input.options.networkTrustedUrls,
+    });
+    // A per-run launcher keeps both native and Node-based Codex commands behind the same bridge.
+    files[path.posix.basename(executable)] = `#!/usr/bin/env node\n${createNetworkProxyBridge({
+      socketPath,
+      executable: input.executable,
+    })}`;
+  }
+  args.push("--chdir", cwd, "--", executable, ...input.args);
+  return { command: input.options.command?.trim() || "bwrap", args, cwd, files };
 }
 
 export async function buildLocalProcessSandboxSpawnTarget(input: {
@@ -378,7 +471,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   }
 
   const bwrapCommand = input.options.command?.trim() || "bwrap";
-  const args = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts"];
+  const args = [...BWRAP_BASE_ARGS];
   const env: Record<string, string | undefined> = {};
   let cleanup: (() => Promise<void>) | undefined;
   let executable = input.executable;
@@ -472,19 +565,8 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     }
   }
 
-  if (networkScope) {
-    args.push("--unshare-net");
-    for (const key of PROXY_ENV_KEYS) env[key] = undefined;
-    env.NO_PROXY = "";
-    env.no_proxy = "";
-  }
-  if (networkScope === "allowlist") {
-    const proxyUrl = `http://127.0.0.1:${SANDBOX_PROXY_PORT}`;
-    env.HTTP_PROXY = proxyUrl;
-    env.HTTPS_PROXY = proxyUrl;
-    env.http_proxy = proxyUrl;
-    env.https_proxy = proxyUrl;
-  }
+  if (networkScope) args.push("--unshare-net");
+  Object.assign(env, sandboxNetworkEnv(networkScope));
 
   args.push("--chdir", cwd, "--", executable, ...executableArgs);
   return { command: bwrapCommand, args, cwd: "/", env, cleanup };

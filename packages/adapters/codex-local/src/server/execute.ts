@@ -594,7 +594,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
   const networkScope = parseLocalProcessNetworkScope(config.networkScope);
-  if (adapterExecutionTargetIsRemote(executionTarget) && (filesystemScope || networkScope)) {
+  if (
+    executionTarget?.kind === "remote"
+    && (filesystemScope || (networkScope && executionTarget.transport !== "ssh"))
+  ) {
     return {
       exitCode: 1,
       signal: null,
@@ -1009,7 +1012,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     );
     const billingType = resolveCodexBillingType(effectiveEnv);
     const localProcessSandbox: LocalProcessSandboxOptions | null =
-      (filesystemScope || networkScope) && !executionTargetIsRemote
+      (filesystemScope || networkScope)
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
@@ -1023,7 +1026,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             networkScope,
             networkAllowlist: parseLocalProcessNetworkAllowlist(config.networkAllowlist),
             networkTrustedUrls: [
-              paperclipBaseEnv.PAPERCLIP_API_URL,
+              paperclipBridge?.env.PAPERCLIP_API_URL ?? paperclipBaseEnv.PAPERCLIP_API_URL,
               ...runtimeMcpGateways.map((gateway) => gateway.endpointPath),
             ],
             command: asString(config.filesystemSandboxCommand, "bwrap"),
