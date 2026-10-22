@@ -73,6 +73,9 @@ export function setExpensiveWorkspaceGitExecutor(executor: ExpensiveWorkspaceGit
 
 export const GIT_ARCHIVE_EXCLUDES = [".git", ".git/*"] as const;
 
+// Host-side Git must not execute hooks or fsmonitor from an agent-writable repo.
+export const REMOTE_GIT_COMMAND = "git -c core.hooksPath=/dev/null -c core.fsmonitor=false";
+
 /**
  * Identity flags for commits the sync machinery itself creates (the merge
  * commits that reconcile concurrent histories). Execution hosts are often
@@ -740,7 +743,7 @@ export function buildRemoteGitDeltaBundleScript(input: {
   const cleanupParts = [
     `rm -f ${bundlePath}`,
     ...(statusPath ? [`rm -f ${statusPath}`] : []),
-    `git -C ${remoteDir} update-ref -d ${exportRef} >/dev/null 2>&1 || true`,
+    `${REMOTE_GIT_COMMAND} -C ${remoteDir} update-ref -d ${exportRef} >/dev/null 2>&1 || true`,
   ];
   return [
     "set -e",
@@ -768,8 +771,8 @@ export function buildRemoteGitDeltaBundleScript(input: {
     ...(input.forceFullBundle
       ? [`bundle_base=""`]
       : [
-        `if git -C ${remoteDir} cat-file -e ${baseSha}^{commit} 2>/dev/null; then`,
-        `  bundle_base=$(git -C ${remoteDir} merge-base ${baseSha} HEAD 2>/dev/null || true)`,
+        `if ${REMOTE_GIT_COMMAND} -C ${remoteDir} cat-file -e ${baseSha}^{commit} 2>/dev/null; then`,
+        `  bundle_base=$(${REMOTE_GIT_COMMAND} -C ${remoteDir} merge-base ${baseSha} HEAD 2>/dev/null || true)`,
         "else",
         `  bundle_base=""`,
         "fi",
@@ -777,27 +780,27 @@ export function buildRemoteGitDeltaBundleScript(input: {
     // An empty bundle means "still at baseSha" to the importer. A reset to an
     // older ancestor has no delta commits either, but must carry its new tip.
     // Use the full-bundle path so Git advertises that tip instead of losing it.
-    `if [ -n "$bundle_base" ] && [ "$bundle_base" != ${baseSha} ] && [ "$bundle_base" = "$(git -C ${remoteDir} rev-parse HEAD)" ]; then`,
+    `if [ -n "$bundle_base" ] && [ "$bundle_base" != ${baseSha} ] && [ "$bundle_base" = "$(${REMOTE_GIT_COMMAND} -C ${remoteDir} rev-parse HEAD)" ]; then`,
     `  bundle_base=""`,
     "fi",
     `if [ -n "$bundle_base" ]; then`,
-    `  commit_count=$(git -C ${remoteDir} rev-list --count HEAD --not "$bundle_base")`,
+    `  commit_count=$(${REMOTE_GIT_COMMAND} -C ${remoteDir} rev-list --count HEAD --not "$bundle_base")`,
     "else",
-    `  commit_count=$(git -C ${remoteDir} rev-list --count HEAD)`,
+    `  commit_count=$(${REMOTE_GIT_COMMAND} -C ${remoteDir} rev-list --count HEAD)`,
     "fi",
     'if [ "$commit_count" -gt 0 ]; then',
-    `  git -C ${remoteDir} update-ref ${exportRef} HEAD`,
+    `  ${REMOTE_GIT_COMMAND} -C ${remoteDir} update-ref ${exportRef} HEAD`,
     `  if [ -n "$bundle_base" ]; then`,
-    `    git -C ${remoteDir} bundle create ${bundlePath} ${exportRef} --not "$bundle_base" >/dev/null`,
+    `    ${REMOTE_GIT_COMMAND} -C ${remoteDir} bundle create ${bundlePath} ${exportRef} --not "$bundle_base" >/dev/null`,
     "  else",
-    `    git -C ${remoteDir} bundle create ${bundlePath} ${exportRef} >/dev/null`,
+    `    ${REMOTE_GIT_COMMAND} -C ${remoteDir} bundle create ${bundlePath} ${exportRef} >/dev/null`,
     "  fi",
     "else",
     `  : > ${bundlePath}`,
     "fi",
     statusPath
       ? [
-        `git -C ${remoteDir} status --porcelain=v1 --untracked-files=normal -z > ${shellQuote(`${input.statusPath}.git-status`)}`,
+        `${REMOTE_GIT_COMMAND} -C ${remoteDir} status --porcelain=v1 --untracked-files=normal -z > ${shellQuote(`${input.statusPath}.git-status`)}`,
         `if [ ! -s ${shellQuote(`${input.statusPath}.git-status`)} ]; then`,
         `  printf clean > ${statusPath}`,
         "else",

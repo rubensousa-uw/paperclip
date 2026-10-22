@@ -10,6 +10,7 @@ import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
   PROJECT_REPOSITORIES_DIR,
+  REMOTE_GIT_COMMAND,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
@@ -790,24 +791,24 @@ async function importGitWorkspaceToSsh(input: {
       `tmp_bundle=$(mktemp ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime", "import-XXXXXX.bundle"))})`,
       'trap \'rm -f "$tmp_bundle"\' EXIT',
       'cat > "$tmp_bundle"',
-      `if [ ! -d ${shellQuote(path.posix.join(input.remoteDir, ".git"))} ]; then git init ${shellQuote(input.remoteDir)} >/dev/null; fi`,
+      `if [ ! -d ${shellQuote(path.posix.join(input.remoteDir, ".git"))} ]; then ${REMOTE_GIT_COMMAND} init ${shellQuote(input.remoteDir)} >/dev/null; fi`,
       // Carry the workspace's (credential-scrubbed) origin into the transported
       // repo so branches there keep a publishable remote instead of reading as
       // remote-less snapshots. set-url covers a reused workspace whose origin
       // changed; add covers the fresh-init case. Best-effort under `set -e`.
       ...(originUrl
         ? [
-          `{ git -C ${shellQuote(input.remoteDir)} remote set-url origin ${shellQuote(originUrl)} >/dev/null 2>&1 || git -C ${shellQuote(input.remoteDir)} remote add origin ${shellQuote(originUrl)} >/dev/null 2>&1; } || true`,
+          `{ ${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} remote set-url origin ${shellQuote(originUrl)} >/dev/null 2>&1 || ${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} remote add origin ${shellQuote(originUrl)} >/dev/null 2>&1; } || true`,
         ]
         : []),
-      `git -C ${shellQuote(input.remoteDir)} fetch --force "$tmp_bundle" '${tempRef}:${tempRef}' >/dev/null`,
+      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} fetch --force "$tmp_bundle" '${tempRef}:${tempRef}' >/dev/null`,
       input.snapshot.branchName
-        ? `git -C ${shellQuote(input.remoteDir)} checkout --force -B ${shellQuote(input.snapshot.branchName)} ${shellQuote(input.snapshot.headCommit)} >/dev/null`
-        : `git -C ${shellQuote(input.remoteDir)} -c advice.detachedHead=false checkout --force --detach ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
-      `git -C ${shellQuote(input.remoteDir)} reset --hard ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
-      `git -C ${shellQuote(input.remoteDir)} clean -fdx -e .paperclip-runtime >/dev/null`,
+        ? `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} checkout --force -B ${shellQuote(input.snapshot.branchName)} ${shellQuote(input.snapshot.headCommit)} >/dev/null`
+        : `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} -c advice.detachedHead=false checkout --force --detach ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
+      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} reset --hard ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
+      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} clean -fdx -e .paperclip-runtime >/dev/null`,
       // Drop the per-import ref on the remote side too so it can't accumulate.
-      `git -C ${shellQuote(input.remoteDir)} update-ref -d ${shellQuote(tempRef)} >/dev/null 2>&1 || true`,
+      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} update-ref -d ${shellQuote(tempRef)} >/dev/null 2>&1 || true`,
     ].join("\n");
 
     // The git bundle is a real local file of known size, so report an exact
@@ -859,12 +860,12 @@ async function exportGitWorkspaceFromSsh(input: {
   try {
     const exportScript = [
       "set -e",
-      `git -C ${shellQuote(input.remoteDir)} update-ref refs/paperclip/ssh-sync/export HEAD`,
+      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} update-ref refs/paperclip/ssh-sync/export HEAD`,
       `mkdir -p ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime"))}`,
       `tmp_bundle=$(mktemp ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime", "export-XXXXXX.bundle"))})`,
-      'cleanup() { rm -f "$tmp_bundle"; git -C ' + shellQuote(input.remoteDir) + ' update-ref -d refs/paperclip/ssh-sync/export >/dev/null 2>&1 || true; }',
+      `cleanup() { rm -f "$tmp_bundle"; ${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} update-ref -d refs/paperclip/ssh-sync/export >/dev/null 2>&1 || true; }`,
       'trap cleanup EXIT',
-      `git -C ${shellQuote(input.remoteDir)} bundle create "$tmp_bundle" refs/paperclip/ssh-sync/export >/dev/null`,
+      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} bundle create "$tmp_bundle" refs/paperclip/ssh-sync/export >/dev/null`,
       'cat "$tmp_bundle"',
     ].join("\n");
 
