@@ -53,14 +53,15 @@ const mocks = vi.hoisted(() => ({
     },
     stop: async () => {},
   })),
-  prepareAdapterExecutionTargetRuntime: vi.fn(async () => ({
+  // Typed to accept the real call's arguments, so the pass-through wrappers below need no cast.
+  prepareAdapterExecutionTargetRuntime: vi.fn(async (..._args: unknown[]) => ({
     target: { kind: "remote", transport: "sandbox", remoteCwd: "/sandbox/workspace" },
     workspaceRemoteDir: "/sandbox/workspace",
     runtimeRootDir: "/sandbox/.paperclip-runtime",
     assetDirs: { home: "/sandbox/.paperclip-runtime/codex/home" },
     restoreWorkspace: vi.fn(async () => undefined),
   })),
-  runAdapterExecutionTargetProcess: vi.fn(async () => ({
+  runAdapterExecutionTargetProcess: vi.fn(async (..._args: unknown[]) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -120,7 +121,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
     prepareAdapterExecutionTargetRuntime: vi.fn((...args: Parameters<typeof actual.prepareAdapterExecutionTargetRuntime>) => {
       const target = (args[0] as { target?: { transport?: string } } | undefined)?.target;
       return target?.transport === "sandbox"
-        ? mocks.prepareAdapterExecutionTargetRuntime(...(args as []))
+        ? mocks.prepareAdapterExecutionTargetRuntime(...args)
         : actual.prepareAdapterExecutionTargetRuntime(...args);
     }),
     // Only the sandbox transport is faked; local and SSH go through the real runner, which
@@ -128,7 +129,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
     runAdapterExecutionTargetProcess: vi.fn((...args: Parameters<typeof actual.runAdapterExecutionTargetProcess>) => {
       const target = args[1] as { transport?: string } | null | undefined;
       return target?.transport === "sandbox"
-        ? mocks.runAdapterExecutionTargetProcess(...(args as []))
+        ? mocks.runAdapterExecutionTargetProcess(...args)
         : actual.runAdapterExecutionTargetProcess(...args);
     }),
     runAdapterExecutionTargetShellCommand: mocks.runAdapterExecutionTargetShellCommand,
