@@ -130,7 +130,11 @@ function parseNetworkAllowlistEntry(entry: string, index: number): NetworkAllowl
       throw new Error("path");
     }
     hostname = parsed.hostname.toLowerCase();
-    port = parsed.port || null;
+    // URL.port drops explicit scheme-default ports. Read the authority as well
+    // so host:443 (and http://host:80) never become an any-port rule.
+    const authority = trimmed.replace(/^[a-z][a-z\d+.-]*:\/\//i, "").split(/[/?#]/, 1)[0];
+    const explicitPort = authority.match(/:(\d+)$/)?.[1];
+    port = explicitPort ? String(Number(explicitPort)) : parsed.port || null;
   } catch {
     throw new Error(`networkAllowlist[${index}] must be a hostname, hostname:port, or origin URL.`);
   }
