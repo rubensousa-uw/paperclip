@@ -530,3 +530,80 @@ describe("remote network allowlist proxy script", () => {
     }
   });
 });
+
+/**
+ * Review of 9150f1222 (MEDIUM): an explicit port means that port only, default ports included;
+ * no port still means any port. Before: `new URL("https://host:443").port` is "" so `host:443`
+ * normalised to "any port" (local-process-sandbox.ts:133).
+ */
+describe("explicit allowlist ports", () => {
+  const build = (sandboxModule as Record<string, unknown>).buildRemoteNetworkAllowlistProxyScript as
+    | ((input: { networkAllowlist: string[]; networkTrustedUrls?: string[] }) => string)
+    | undefined;
+
+  it("keeps an explicit default port in the normalised allowlist", () => {
+    expect(parseLocalProcessNetworkAllowlist(["example.com:443", "example.org:80", "example.net"]))
+      .toEqual(["example.com:443", "example.org:80", "example.net"]);
+  });
+
+  it.runIf(process.platform === "linux")("an explicit :443 denies another port through the real proxy", async () => {
+    expect(typeof build).toBe("function");
+    const upstream = net.createServer((socket) => socket.end());
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", () => resolve()));
+    const port = (upstream.address() as net.AddressInfo).port;
+    const dir = await fs.mkdtemp(path.join("/tmp", "pcp-port-"));
+    cleanup.push(dir);
+    const scriptPath = path.join(dir, "proxy.mjs");
+    const socketPath = path.join(dir, "proxy.sock");
+    await fs.writeFile(scriptPath, build!({ networkAllowlist: ["127.0.0.1:443"], networkTrustedUrls: [] }), "utf8");
+    const child = spawn(process.execPath, [scriptPath, socketPath], { stdio: "ignore" });
+    try {
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if (await fs.stat(socketPath).then(() => true, () => false)) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const response = await new Promise<string>((resolve, reject) => {
+        const socket = net.connect(socketPath);
+        let received = "";
+        socket.on("data", (chunk) => { received += chunk.toString("utf8"); });
+        socket.on("error", reject);
+        socket.on("close", () => resolve(received));
+        setTimeout(() => socket.destroy(), 2000);
+        socket.write(`CONNECT 127.0.0.1:${port} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`);
+      });
+      expect(response).toMatch(/^HTTP\/1\.1 403/);
+      expect(response).toContain("network_target_denied");
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  });
+});
+
+/**
+ * Review of 9150f1222: the remote proxy must be explicit source, like the bridge
+ * (`createNetworkProxyBridge`), not `Function.prototype.toString()` of module functions
+ * (local-process-sandbox.ts:340). Why: toString returns whatever the toolchain emitted for
+ * those functions — after a bundler or esbuild `keepNames` it can reference helpers such as
+ * `__name` that do not exist in the standalone script, and renaming a module function changes the
+ * shipped program. Asserted statically on the module source and on the generated output.
+ */
+describe("remote proxy script is an explicit template", () => {
+  it("does not serialise module functions", async () => {
+    const source = await fs.readFile(new URL("./local-process-sandbox.ts", import.meta.url), "utf8");
+    const start = source.indexOf("export function buildRemoteNetworkAllowlistProxyScript");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = source.indexOf("\n}\n", start);
+    const body = source.slice(start, end);
+    expect(body).not.toMatch(/\.toString\(\)/);
+  });
+
+  it("emits no toolchain helpers", () => {
+    const build = (sandboxModule as Record<string, unknown>).buildRemoteNetworkAllowlistProxyScript as
+      (input: { networkAllowlist: string[]; networkTrustedUrls?: string[] }) => string;
+    const script = build({ networkAllowlist: ["api.openai.com"], networkTrustedUrls: [] });
+    for (const helper of ["__name(", "__defProp", "__publicField", "_ts_decorate"]) {
+      expect(script).not.toContain(helper);
+    }
+  });
+});
