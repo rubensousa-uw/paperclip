@@ -15,6 +15,9 @@
  *    that pid, after checking `/proc/<pid>/cmdline` names the run's `proxy.mjs`.
  * 3. Fail closed: if the proxy socket is not ready, cleanup runs and nothing is spawned.
  */
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -218,5 +221,114 @@ describe("remote network sandbox lifecycle over SSH", () => {
     const cleanup = commands[commands.length - 1];
     expect(cleanup).toMatch(/rm -rf/);
     expect(cleanup).not.toContain("proxy.pid");
+  });
+});
+
+/**
+ * Re-review of 796f09775 (HIGH): the setup checks that writable paths do not contain HOME, but
+ * not that a protected file is an alias INTO a writable path (execution-target.ts:~918). Case:
+ * `~/.bashrc` is an existing symlink to a file in the workspace, so the confined agent edits it
+ * and the next SSH command sources it unconfined (ssh.ts:1313-1316). Decision: the setup
+ * canonicalises `/etc/profile`, `/etc/profile.d/*`, `~/.profile`, `~/.bash_profile`, `~/.bashrc`,
+ * `~/.zprofile` and `~/.ssh/*` and refuses when any canonical target lies under a writable bind
+ * (workspace or CODEX_HOME).
+ *
+ * The generated setup is run for real with `sh`, HOME in a temp dir, and stub `bwrap`/`node` on
+ * PATH; the stub `node` records each call, so "refused before any file is written" means exit != 0
+ * with no `node` call.
+ */
+describe("remote setup refuses login-profile aliases into writable paths", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    mocks.runSshCommand.mockImplementation(async () => ({ stdout: "4242\n", stderr: "" }));
+  });
+
+  async function setupScriptFor(workspace: string, codexHome: string): Promise<string> {
+    mocks.runSshCommand.mockImplementation(async () => ({ stdout: "4242\n", stderr: "" }));
+    await runAdapterExecutionTargetProcess(
+      "run-alias",
+      { ...SSH_TARGET, remoteCwd: workspace, spec: { ...SSH_TARGET.spec, remoteCwd: workspace } } as never,
+      "codex",
+      ["exec", "-"],
+      {
+        cwd: workspace,
+        env: {},
+        timeoutSec: 30,
+        graceSec: 5,
+        onLog: async () => {},
+        localProcessSandbox: { ...SANDBOX_OPTIONS, workspaceDir: workspace, managedPaths: [{ path: codexHome, access: "rw" }] },
+      } as never,
+    ).catch(() => undefined);
+    return String(mocks.runSshCommand.mock.calls[0]?.[1] ?? "");
+  }
+
+  async function runSetup(alias: { file: string; into: "workspace" | "codexHome" | null }) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "pcp-alias-"));
+    try {
+      const home = path.join(root, "home");
+      const workspace = path.join(root, "work", "run-1");
+      const codexHome = path.join(workspace, ".paperclip-runtime", "codex", "home");
+      const bin = path.join(root, "bin");
+      const nodeLog = path.join(root, "node-calls.log");
+      await fs.mkdir(path.join(home, ".ssh"), { recursive: true });
+      await fs.mkdir(codexHome, { recursive: true });
+      await fs.mkdir(bin, { recursive: true });
+      await fs.writeFile(path.join(bin, "bwrap"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      await fs.writeFile(path.join(bin, "node"), `#!/bin/sh\necho "$@" >> '${nodeLog}'\nexit 0\n`, { mode: 0o755 });
+      for (const name of [".profile", ".bash_profile", ".zprofile"]) {
+        await fs.writeFile(path.join(home, name), "# real profile\n");
+      }
+      await fs.writeFile(path.join(home, ".bashrc"), "# real bashrc\n");
+      if (alias.into) {
+        const targetDir = alias.into === "workspace" ? workspace : codexHome;
+        const target = path.join(targetDir, "planted.sh");
+        await fs.writeFile(target, "# agent-controlled\n");
+        await fs.rm(path.join(home, alias.file), { force: true });
+        await fs.symlink(target, path.join(home, alias.file));
+      }
+      const script = await setupScriptFor(workspace, codexHome);
+      expect(script.length).toBeGreaterThan(0);
+      const outcome = await new Promise<{ code: number; stderr: string }>((resolve) => {
+        execFile("sh", ["-c", script], {
+          env: { HOME: home, PATH: `${bin}:/usr/bin:/bin` },
+          timeout: 20_000,
+        }, (error, _stdout, stderr) => {
+          resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, stderr: String(stderr) });
+        });
+      });
+      const nodeCalls = await fs.readFile(nodeLog, "utf8").catch(() => "");
+      return { ...outcome, nodeCalls };
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it.runIf(process.platform === "linux")("a clean home passes the checks (control)", async () => {
+    const { nodeCalls } = await runSetup({ file: ".bashrc", into: null });
+    expect(nodeCalls).not.toBe("");
+  });
+
+  for (const [file, into] of [
+    [".bashrc", "workspace"],
+    [".profile", "workspace"],
+    [".bash_profile", "codexHome"],
+    [".zprofile", "workspace"],
+    [".ssh/authorized_keys", "workspace"],
+    [".ssh/config", "codexHome"],
+  ] as const) {
+    it.runIf(process.platform === "linux")(`refuses ~/${file} symlinked into the ${into}`, async () => {
+      const { code, nodeCalls } = await runSetup({ file, into });
+      expect(code).not.toBe(0);
+      expect(nodeCalls).toBe("");
+    });
+  }
+
+  it("canonicalises the protected files", async () => {
+    const script = await setupScriptFor("/home/factory/workspaces/run-1",
+      "/home/factory/workspaces/run-1/.paperclip-runtime/codex/home");
+    expect(script).toMatch(/realpath|readlink -f/);
+    for (const name of ["/etc/profile", "/etc/profile.d", ".profile", ".bash_profile", ".bashrc", ".zprofile", ".ssh"]) {
+      expect(script).toContain(name);
+    }
   });
 });
