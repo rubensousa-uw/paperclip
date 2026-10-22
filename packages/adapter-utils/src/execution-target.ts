@@ -872,15 +872,57 @@ async function prepareSshNetworkSandboxSpawnTarget(input: {
     options: input.options,
   });
   const quotedDir = shellQuote(runtimeDir);
-  const cleanupCommand = [
-    `if [ -f ${quotedDir}/proxy.pid ]; then kill "$(cat ${quotedDir}/proxy.pid)" 2>/dev/null || true; fi`,
-    `rm -rf -- ${quotedDir}`,
-  ].join("\n");
+  let proxyPid: number | null = null;
+  const cleanupCommand = () => {
+    // A failed setup may have started the proxy without returning its pid.
+    // Match argv paths in this run's UUID directory, never a process-name pattern
+    // (or the cleanup shell's own inline source, which also mentions that path).
+    const findRunProcesses = `
+const fs = require("node:fs");
+const runtimeDir = ${JSON.stringify(runtimeDir)};
+for (const entry of fs.readdirSync("/proc")) {
+  if (!/^[1-9][0-9]*$/.test(entry) || Number(entry) === process.pid) continue;
+  try {
+    if (fs.statSync("/proc/" + entry).uid !== process.getuid()) continue;
+    const argv = fs.readFileSync("/proc/" + entry + "/cmdline", "utf8").split("\\0");
+    if (argv.some(arg => arg === runtimeDir || arg.startsWith(runtimeDir + "/"))) {
+      process.kill(Number(entry), "SIGTERM");
+    }
+  } catch { /* The process may have exited or belong to a different uid. */ }
+}
+`;
+    const verifyProxy = proxyPid === null ? null : `
+const fs = require("node:fs");
+try {
+  const sameUid = fs.statSync("/proc/${proxyPid}").uid === process.getuid();
+  const argv = fs.readFileSync("/proc/${proxyPid}/cmdline", "utf8").split("\\0");
+  process.exit(sameUid && argv.includes(${JSON.stringify(path.posix.join(runtimeDir, "proxy.mjs"))}) ? 0 : 1);
+} catch { process.exit(1); }
+`;
+    return [
+      verifyProxy === null
+        ? `node -e ${shellQuote(findRunProcesses)}`
+        : `if node -e ${shellQuote(verifyProxy)}; then kill -- ${proxyPid} 2>/dev/null || true; fi`,
+      `rm -rf -- ${quotedDir}`,
+    ].join("\n");
+  };
   const scripts = Object.entries(sandbox.files);
   const setup = [
     "set -eu",
     '[ "$(uname -s)" = Linux ] || { echo "Remote process confinement requires Linux." >&2; exit 1; }',
     `command -v ${shellQuote(sandbox.command)} >/dev/null || { echo "Remote process confinement requires Bubblewrap." >&2; exit 1; }`,
+    // Reject workspace/home configurations (including symlink aliases) that
+    // would put login profiles inside a writable mount. These are sourced by
+    // later SSH commands outside the sandbox. pwd -P needs no Node dependency
+    // for networkScope="deny".
+    'remote_home=$(cd "$HOME" && pwd -P)',
+    ...[input.target.remoteCwd, ...(input.options.managedPaths ?? [])
+      .filter((managedPath) => managedPath.access === "rw").map((managedPath) => managedPath.path)]
+      .map((writablePath) => [
+        `writable_path=$(cd ${shellQuote(writablePath)} && pwd -P)`,
+        'case "$remote_home/" in "$writable_path/"*) echo "Remote sandbox writable paths must not contain HOME." >&2; exit 1;; esac',
+        'case "$writable_path" in /|/etc|/etc/*|"$remote_home"/.profile|"$remote_home"/.profile/*|"$remote_home"/.bash_profile|"$remote_home"/.bash_profile/*|"$remote_home"/.bashrc|"$remote_home"/.bashrc/*|"$remote_home"/.zprofile|"$remote_home"/.zprofile/*|"$remote_home"/.ssh|"$remote_home"/.ssh/*) echo "Remote sandbox writable path overlaps login configuration." >&2; exit 1;; esac',
+      ].join("\n")),
   ];
   if (scripts.length > 0) {
     const writeFiles = [
@@ -905,15 +947,23 @@ const timer = setInterval(() => {
       'command -v node >/dev/null || { echo "Remote allowlist confinement requires Node.js." >&2; exit 1; }',
       `node -e ${shellQuote(writeFiles)}`,
       `node ${quotedDir}/proxy.mjs ${quotedDir}/proxy.sock >${quotedDir}/proxy.log 2>&1 </dev/null &`,
-      `echo $! >${quotedDir}/proxy.pid`,
       `node -e ${shellQuote(waitForProxy)}`,
+      'echo "$!"',
     );
   }
   try {
-    await runSshCommand(input.target.spec, setup.join("\n"), { env: input.env, timeoutMs: 15_000 });
+    const result = await runSshCommand(input.target.spec, setup.join("\n"), { env: input.env, timeoutMs: 15_000 });
+    if (scripts.length > 0) {
+      const lastLine = result.stdout.trimEnd().split(/\r?\n/).at(-1) ?? "";
+      const pid = /^[1-9][0-9]*$/.test(lastLine) ? Number(lastLine) : NaN;
+      if (!Number.isSafeInteger(pid) || pid <= 1) {
+        throw new Error("Remote Paperclip network proxy setup did not return a valid pid.");
+      }
+      proxyPid = pid;
+    }
   } catch (error) {
     if (scripts.length > 0) {
-      await runSshCommand(input.target.spec, cleanupCommand, { env: input.env, timeoutMs: 15_000 })
+      await runSshCommand(input.target.spec, cleanupCommand(), { env: input.env, timeoutMs: 15_000 })
         .catch(() => undefined);
     }
     throw error;
@@ -922,7 +972,7 @@ const timer = setInterval(() => {
     ...sandbox,
     cleanup: scripts.length > 0
       ? async () => {
-          await runSshCommand(input.target.spec, cleanupCommand, { env: input.env, timeoutMs: 15_000 });
+          await runSshCommand(input.target.spec, cleanupCommand(), { env: input.env, timeoutMs: 15_000 });
         }
       : undefined,
   };

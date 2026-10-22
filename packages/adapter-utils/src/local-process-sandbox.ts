@@ -250,7 +250,7 @@ async function startNetworkAllowlistProxy(
   return await listenNetworkAllowlistProxy(http, net, rules, socketPath);
 }
 
-// Keep the proxy implementation self-contained so SSH targets use the same policy and protocol.
+// Keep protocol changes in sync with the explicit remote proxy source below.
 async function listenNetworkAllowlistProxy(
   httpModule: typeof http,
   netModule: typeof net,
@@ -338,15 +338,81 @@ export function buildRemoteNetworkAllowlistProxyScript(input: {
       'networkScope="allowlist" requires at least one valid networkAllowlist hostname or HTTP(S) networkTrustedUrl.',
     );
   }
-  return [
-    'import http from "node:http";',
-    'import net from "node:net";',
-    isNetworkTargetAllowed.toString(),
-    writeProxyError.toString(),
-    connectProxyError.toString(),
-    listenNetworkAllowlistProxy.toString(),
-    `await listenNetworkAllowlistProxy(http, net, ${JSON.stringify(rules)}, process.argv[2]);`,
-  ].join("\n");
+  // Ship explicit JavaScript: serialising compiled functions can leak bundler helpers.
+  // Rules are parsed on the controller by the same policy used by the local proxy.
+  return String.raw`
+import http from "node:http";
+import net from "node:net";
+const rules = ${JSON.stringify(rules)};
+const socketPath = process.argv[2];
+function isAllowed(hostname, port) {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return rules.some(rule => rule.hostname === normalized && (rule.port === null || rule.port === port));
+}
+function errorBody(code, message) {
+  return JSON.stringify({ error: { code, message } }) + "\n";
+}
+function writeError(response, status, code, message) {
+  const body = errorBody(code, message);
+  response.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+  }).end(body);
+}
+const server = http.createServer((request, response) => {
+  let target;
+  try {
+    target = new URL(request.url ?? "");
+  } catch {
+    writeError(response, 400, "invalid_request_url", "Paperclip sandbox proxy requires an absolute request URL.");
+    return;
+  }
+  const port = target.port || (target.protocol === "https:" ? "443" : "80");
+  if (target.protocol !== "http:") {
+    writeError(response, 400, "https_requires_connect", "HTTPS targets must use CONNECT through the Paperclip sandbox proxy.");
+    return;
+  }
+  if (!isAllowed(target.hostname, port)) {
+    writeError(response, 403, "network_target_denied", "Network target denied by Paperclip sandbox policy.");
+    return;
+  }
+  const upstream = http.request(target, {
+    method: request.method,
+    headers: { ...request.headers, host: target.host },
+  }, upstreamResponse => {
+    response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+    upstreamResponse.pipe(response);
+  });
+  upstream.on("error", error => response.destroy(error));
+  request.pipe(upstream);
+});
+server.on("connect", (request, clientSocket, head) => {
+  const separator = request.url?.lastIndexOf(":") ?? -1;
+  const hostname = separator > 0 ? request.url.slice(0, separator).replace(/^\[|\]$/g, "") : "";
+  const port = separator > 0 ? request.url.slice(separator + 1) : "443";
+  if (!hostname || !/^\d+$/.test(port) || !isAllowed(hostname, port)) {
+    const body = errorBody("network_target_denied", "Network target denied by Paperclip sandbox policy.");
+    clientSocket.end([
+      "HTTP/1.1 403 Forbidden",
+      "Connection: close",
+      "Content-Type: application/json; charset=utf-8",
+      "Content-Length: " + Buffer.byteLength(body),
+      "",
+      body,
+    ].join("\r\n"));
+    return;
+  }
+  const upstream = net.connect(Number(port), hostname, () => {
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    if (head.length > 0) upstream.write(head);
+    upstream.pipe(clientSocket);
+    clientSocket.pipe(upstream);
+  });
+  upstream.on("error", () => clientSocket.destroy());
+  clientSocket.on("close", () => upstream.destroy());
+});
+server.listen(socketPath);
+`.trimStart();
 }
 
 function createNetworkProxyBridge(input?: { socketPath: string; executable: string }): string {
@@ -411,7 +477,26 @@ export function buildRemoteNetworkSandboxSpawnTarget(input: {
   }
   const cwd = path.posix.resolve(input.cwd);
   const runtimeDir = path.posix.resolve(input.runtimeDir);
-  const args = [...BWRAP_BASE_ARGS, "--bind", "/", "/", "--unshare-net"];
+  if (cwd === "/") throw new Error("Remote sandbox workspace must not be the filesystem root.");
+  const args = [
+    ...BWRAP_BASE_ARGS, "--ro-bind", "/", "/", "--unshare-net",
+    "--proc", "/proc", "--bind", cwd, cwd,
+  ];
+  for (const managedPath of input.options.managedPaths ?? []) {
+    if (!path.posix.isAbsolute(managedPath.path)) {
+      throw new Error("Remote sandbox managed paths must be absolute POSIX paths.");
+    }
+    const managedDir = path.posix.resolve(managedPath.path);
+    if (managedPath.access === "rw" && managedDir === "/") {
+      throw new Error("Remote sandbox writable managed paths must not be the filesystem root.");
+    }
+    args.push(managedPath.access === "rw" ? "--bind" : "--ro-bind", managedDir, managedDir);
+  }
+  // Overlay this last even if the runtime is nested in a writable workspace.
+  // Linux permits connect() to the socket on a read-only filesystem mount.
+  if (input.options.networkScope === "allowlist") {
+    args.push("--ro-bind", runtimeDir, runtimeDir);
+  }
   for (const [key, value] of Object.entries(sandboxNetworkEnv(input.options.networkScope))) {
     args.push(...(value === undefined ? ["--unsetenv", key] : ["--setenv", key, value]));
   }
