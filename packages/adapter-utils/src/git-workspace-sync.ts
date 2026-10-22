@@ -110,7 +110,7 @@ export function remoteGitCommand(
   const sandbox = [
     options.sandboxCommand ?? "bwrap",
     "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
-    "--ro-bind", "/", "/", "--unshare-net", "--proc", "/proc",
+    "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-net", "--proc", "/proc",
     "--bind", remoteDir, remoteDir, "--",
   ].map(shellQuote).join(" ");
   return `${sandbox} ${git}`;

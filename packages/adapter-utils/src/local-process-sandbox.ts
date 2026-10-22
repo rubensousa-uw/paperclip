@@ -491,7 +491,7 @@ export function buildRemoteNetworkSandboxSpawnTarget(input: {
   const runtimeDir = path.posix.resolve(input.runtimeDir);
   if (cwd === "/") throw new Error("Remote sandbox workspace must not be the filesystem root.");
   const args = [
-    ...BWRAP_BASE_ARGS, "--ro-bind", "/", "/", "--unshare-net",
+    ...BWRAP_BASE_ARGS, "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-net",
     "--proc", "/proc", "--bind", cwd, cwd,
   ];
   for (const managedPath of input.options.managedPaths ?? []) {
