@@ -37,7 +37,13 @@ const mocks = vi.hoisted(() => ({
   resolveCommandForLogs: vi.fn(async () => "/usr/bin/codex"),
   prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
-  runSshCommand: vi.fn(async () => ({ stdout: Buffer.from("{}").toString("base64"), stderr: "" })),
+  // The remote network-proxy setup (the only SSH command that starts a background process and
+  // echoes `$!`) prints the proxy pid alone on its last stdout line; every other SSH call keeps
+  // the fixture of execute.remote.test.ts.
+  runSshCommand: vi.fn(async (_spec: unknown, command: string) =>
+    String(command).includes("$!")
+      ? { stdout: "4242\n", stderr: "" }
+      : { stdout: Buffer.from("{}").toString("base64"), stderr: "" }),
   syncDirectoryToSsh: vi.fn(async () => undefined),
   startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => ({
     env: {
@@ -299,5 +305,26 @@ describe("codex confinement on remote execution targets", () => {
       stream: "stdout",
       chunk: "[paperclip] Confining Codex with allowlist network scope.\n",
     });
+  });
+
+  it("fails closed before spawn when the SSH proxy setup returns no pid", async () => {
+    const original = mocks.runSshCommand.getMockImplementation();
+    mocks.runSshCommand.mockImplementation(async (_spec: unknown, command: string) =>
+      String(command).includes("$!")
+        ? { stdout: "", stderr: "" }
+        : { stdout: Buffer.from("{}").toString("base64"), stderr: "" });
+    try {
+      const outcome = await run("ssh", {
+        networkScope: "allowlist",
+        networkAllowlist: ["api.openai.com"],
+      }).then(
+        (value) => ({ value, error: null as unknown }),
+        (error: unknown) => ({ value: null, error }),
+      );
+      expect(mocks.runChildProcess).not.toHaveBeenCalled();
+      expect(outcome.error !== null || outcome.value?.result.exitCode !== 0).toBe(true);
+    } finally {
+      if (original) mocks.runSshCommand.mockImplementation(original);
+    }
   });
 });
