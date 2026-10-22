@@ -123,6 +123,15 @@ describe("remote network sandbox argv (read-only root)", () => {
     });
   }
 
+  it("a read-only root comes with a fresh /dev", () => {
+    const { args } = build();
+    const separator = args.indexOf("--");
+    const options = args.slice(0, separator);
+    const hasRoRoot = options.some((value, i) => value === "--ro-bind" && options[i + 1] === "/" && options[i + 2] === "/");
+    expect(hasRoRoot).toBe(true);
+    expect(options.some((value, i) => value === "--dev" && options[i + 1] === "/dev")).toBe(true);
+  });
+
   it("binds the root read-only, never read-write", () => {
     const { args } = build();
     expect(triples(args, "--bind")).not.toContainEqual(["--bind", "/", "/"]);

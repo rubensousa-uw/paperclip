@@ -124,6 +124,9 @@ describe("(B) host-side git on a confined workspace runs inside bwrap", () => {
     const options = argv.slice(0, separator);
     const pairs = (flag: string) => options.flatMap((value, i) => value === flag ? [[options[i + 1], options[i + 2]]] : []);
     expect(pairs("--ro-bind")).toContainEqual(["/", "/"]);
+    // `-c core.hooksPath=/dev/null` needs a writable /dev/null: `--dev /dev` right after the root.
+    const root = options.findIndex((value, i) => value === "--ro-bind" && options[i + 1] === "/" && options[i + 2] === "/");
+    expect(options.slice(root, root + 5)).toEqual(["--ro-bind", "/", "/", "--dev", "/dev"]);
     expect(options).toContain("--unshare-net");
     expect([...pairs("--bind"), ...pairs("--bind-try"), ...pairs("--dev-bind")])
       .toEqual([["/home/factory/workspaces/run-1", "/home/factory/workspaces/run-1"]]);
@@ -146,6 +149,19 @@ describe("(B) host-side git on a confined workspace runs inside bwrap", () => {
         /\$\{REMOTE_GIT_COMMAND\}\s+-C\b|`git\s+(?:-c\s+\S+\s+)*-C\s/.test(line)
         && !line.includes("function remoteGitCommand"));
       expect({ file, offenders }).toEqual({ file, offenders: [] });
+    }
+  });
+
+  it("a read-only root always comes with a fresh /dev (non-gated)", () => {
+    expect(typeof remoteGitCommand).toBe("function");
+    for (const dir of ["/w", "/home/factory/workspaces/run-1", "/tmp/with space"]) {
+      const argv = tokens(remoteGitCommand!(dir, { confined: true }));
+      const separator = argv.indexOf("--");
+      const options = argv.slice(0, separator);
+      const hasRoRoot = options.some((value, i) => value === "--ro-bind" && options[i + 1] === "/" && options[i + 2] === "/");
+      if (hasRoRoot) {
+        expect(options.some((value, i) => value === "--dev" && options[i + 1] === "/dev")).toBe(true);
+      }
     }
   });
 
@@ -173,11 +189,10 @@ describe("(B) host-side git on a confined workspace runs inside bwrap", () => {
           confined: true,
           sandboxCommand: process.env.PAPERCLIP_TEST_BWRAP,
         });
-        try {
-          execFileSync("sh", ["-c", `${prefix} checkout --force -- file.txt`], { stdio: "ignore" });
-        } catch {
-          // A failing filter under the read-only root is acceptable; only the marker matters.
-        }
+        // The confined checkout must SUCCEED (exit 0) and restore the tracked file; only the
+        // filter's write outside the workspace is blocked (the filter still pipes through `cat`).
+        execFileSync("sh", ["-c", `${prefix} checkout --force -- file.txt`], { stdio: "pipe" });
+        expect(await fs.readFile(path.join(workspace, "file.txt"), "utf8")).toBe("content\n");
         await expect(fs.stat(marker)).rejects.toThrow();
         // Control: the same checkout without the sandbox does run the filter.
         await fs.rm(path.join(workspace, "file.txt"), { force: true });
