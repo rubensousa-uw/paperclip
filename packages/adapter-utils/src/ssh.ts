@@ -10,7 +10,7 @@ import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
   PROJECT_REPOSITORIES_DIR,
-  REMOTE_GIT_COMMAND,
+  remoteGitCommand,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
@@ -31,6 +31,8 @@ export interface SshConnectionConfig {
   privateKey: string | null;
   knownHosts: string | null;
   strictHostKeyChecking: boolean;
+  /** Run-scoped: never source agent-writable user profiles; sandbox remote Git. */
+  confinedRun?: boolean;
 }
 
 export interface SshCommandResult {
@@ -188,6 +190,7 @@ export function parseSshRemoteExecutionSpec(value: unknown): SshRemoteExecutionS
     knownHosts: typeof parsed.knownHosts === "string" && parsed.knownHosts.length > 0 ? parsed.knownHosts : null,
     strictHostKeyChecking:
       typeof parsed.strictHostKeyChecking === "boolean" ? parsed.strictHostKeyChecking : true,
+    ...(parsed.confinedRun === true ? { confinedRun: true } : {}),
   };
 }
 
@@ -785,30 +788,31 @@ async function importGitWorkspaceToSsh(input: {
     });
     const originUrl = await readSanitizedOriginRemoteUrl(input.localDir);
 
+    const git = remoteGitCommand(input.remoteDir, { confined: input.spec.confinedRun === true });
     const remoteSetupScript = [
       "set -e",
       `mkdir -p ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime"))}`,
       `tmp_bundle=$(mktemp ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime", "import-XXXXXX.bundle"))})`,
       'trap \'rm -f "$tmp_bundle"\' EXIT',
       'cat > "$tmp_bundle"',
-      `if [ ! -d ${shellQuote(path.posix.join(input.remoteDir, ".git"))} ]; then ${REMOTE_GIT_COMMAND} init ${shellQuote(input.remoteDir)} >/dev/null; fi`,
+      `if [ ! -d ${shellQuote(path.posix.join(input.remoteDir, ".git"))} ]; then ${git} init >/dev/null; fi`,
       // Carry the workspace's (credential-scrubbed) origin into the transported
       // repo so branches there keep a publishable remote instead of reading as
       // remote-less snapshots. set-url covers a reused workspace whose origin
       // changed; add covers the fresh-init case. Best-effort under `set -e`.
       ...(originUrl
         ? [
-          `{ ${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} remote set-url origin ${shellQuote(originUrl)} >/dev/null 2>&1 || ${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} remote add origin ${shellQuote(originUrl)} >/dev/null 2>&1; } || true`,
+          `{ ${git} remote set-url origin ${shellQuote(originUrl)} >/dev/null 2>&1 || ${git} remote add origin ${shellQuote(originUrl)} >/dev/null 2>&1; } || true`,
         ]
         : []),
-      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} fetch --force "$tmp_bundle" '${tempRef}:${tempRef}' >/dev/null`,
+      `${git} fetch --force "$tmp_bundle" '${tempRef}:${tempRef}' >/dev/null`,
       input.snapshot.branchName
-        ? `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} checkout --force -B ${shellQuote(input.snapshot.branchName)} ${shellQuote(input.snapshot.headCommit)} >/dev/null`
-        : `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} -c advice.detachedHead=false checkout --force --detach ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
-      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} reset --hard ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
-      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} clean -fdx -e .paperclip-runtime >/dev/null`,
+        ? `${git} checkout --force -B ${shellQuote(input.snapshot.branchName)} ${shellQuote(input.snapshot.headCommit)} >/dev/null`
+        : `${git} -c advice.detachedHead=false checkout --force --detach ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
+      `${git} reset --hard ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
+      `${git} clean -fdx -e .paperclip-runtime >/dev/null`,
       // Drop the per-import ref on the remote side too so it can't accumulate.
-      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} update-ref -d ${shellQuote(tempRef)} >/dev/null 2>&1 || true`,
+      `${git} update-ref -d ${shellQuote(tempRef)} >/dev/null 2>&1 || true`,
     ].join("\n");
 
     // The git bundle is a real local file of known size, so report an exact
@@ -858,14 +862,15 @@ async function exportGitWorkspaceFromSsh(input: {
   const importedRef = input.importedRef ?? `refs/paperclip/ssh-sync/imported/${randomUUID()}`;
 
   try {
+    const git = remoteGitCommand(input.remoteDir, { confined: input.spec.confinedRun === true });
     const exportScript = [
       "set -e",
-      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} update-ref refs/paperclip/ssh-sync/export HEAD`,
+      `${git} update-ref refs/paperclip/ssh-sync/export HEAD`,
       `mkdir -p ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime"))}`,
       `tmp_bundle=$(mktemp ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime", "export-XXXXXX.bundle"))})`,
-      `cleanup() { rm -f "$tmp_bundle"; ${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} update-ref -d refs/paperclip/ssh-sync/export >/dev/null 2>&1 || true; }`,
+      `cleanup() { rm -f "$tmp_bundle"; ${git} update-ref -d refs/paperclip/ssh-sync/export >/dev/null 2>&1 || true; }`,
       'trap cleanup EXIT',
-      `${REMOTE_GIT_COMMAND} -C ${shellQuote(input.remoteDir)} bundle create "$tmp_bundle" refs/paperclip/ssh-sync/export >/dev/null`,
+      `${git} bundle create "$tmp_bundle" refs/paperclip/ssh-sync/export >/dev/null`,
       'cat "$tmp_bundle"',
     ].join("\n");
 
@@ -1276,6 +1281,20 @@ export function buildKnownHostsEntry(input: {
   return `[${input.host}]:${input.port} ${input.publicKey.trim()}`;
 }
 
+// System profiles provide the operator's PATH (including /etc/profile.d).
+// Confined runs must not execute user dotfiles that can alias writable content.
+function sshProfileSources(config: SshConnectionConfig): string[] {
+  return [
+    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
+    ...(config.confinedRun ? [] : [
+      'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+      // Avoid sourcing bashrc twice when bash_profile already sources it.
+      'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
+      'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+    ]),
+  ];
+}
+
 export async function runSshCommand(
   config: SshConnectionConfig,
   remoteCommand: string,
@@ -1299,23 +1318,10 @@ export async function runSshCommand(
       }
     }
 
-    // Mirror buildSshSpawnTarget: source the login profiles first, then run
-    // `env KEY=VAL cmd` so user-supplied identity overrides win over anything a
-    // profile re-exports. The SSH target is an operator-configured host, not a
-    // Paperclip sandbox image, so it can expose `node` or an agent CLI only
-    // through a login profile; a non-login SSH command would miss that PATH.
-    // Source `/etc/profile` first so a host that exposes the PATH through
-    // `/etc/profile.d` scripts still resolves node and the agent CLI.
-    // The script no longer sources `nvm.sh`; a profile that adds nvm still runs.
-    // .bash_profile typically sources .bashrc itself; only source .bashrc
-    // directly when no .bash_profile exists, so a host that adds nvm in
-    // .bashrc still resolves node without a double-run of the setup.
+    // Apply explicit environment overrides after the permitted profiles.
     const envArgs = envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`);
     const remoteScript = [
-      'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+      ...sshProfileSources(config),
       envArgs.length > 0
         ? `exec env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
         : `exec sh -c ${shellQuote(remoteCommand)}`,
@@ -1364,22 +1370,9 @@ export async function buildSshSpawnTarget(input: {
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
-  // Source the login profiles first, then run `env KEY=VAL cmd` so
-  // user-supplied identity overrides win over anything a profile re-exports.
-  // The SSH target is an operator-configured host, not a Paperclip sandbox
-  // image, so it can expose `node` or an agent CLI only through a login
-  // profile; a non-login SSH command would miss that PATH. Source
-  // `/etc/profile` first so a host that exposes the PATH through
-  // `/etc/profile.d` scripts still resolves node and the agent CLI. The script
-  // no longer sources `nvm.sh`; a profile that adds nvm still runs.
-  // .bash_profile typically sources .bashrc itself; only source .bashrc
-  // directly when no .bash_profile exists, so a host that adds nvm in
-  // .bashrc still resolves node without a double-run of the setup.
+  // Apply explicit environment overrides after the permitted profiles.
   const remoteScript = [
-    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+    ...sshProfileSources(input.spec),
     `cd ${shellQuote(input.spec.remoteCwd)}`,
     envArgs.length > 0
       ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`

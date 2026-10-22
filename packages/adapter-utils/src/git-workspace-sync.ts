@@ -97,6 +97,25 @@ function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
+/** Confine repo-controlled Git helpers to the workspace, without network access. */
+export function remoteGitCommand(
+  remoteDir: string,
+  options: { confined: boolean; sandboxCommand?: string },
+): string {
+  const git = [REMOTE_GIT_COMMAND, "-C", shellQuote(remoteDir)].join(" ");
+  if (!options.confined) return git;
+  if (!path.posix.isAbsolute(remoteDir) || path.posix.resolve(remoteDir) === "/") {
+    throw new Error("Confined remote Git requires an absolute workspace path other than root.");
+  }
+  const sandbox = [
+    options.sandboxCommand ?? "bwrap",
+    "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+    "--ro-bind", "/", "/", "--unshare-net", "--proc", "/proc",
+    "--bind", remoteDir, remoteDir, "--",
+  ].map(shellQuote).join(" ");
+  return `${sandbox} ${git}`;
+}
+
 export async function runLocalGit(
   localDir: string,
   args: string[],
@@ -722,6 +741,8 @@ export function isMissingGitPrerequisiteError(error: unknown): boolean {
 
 export function buildRemoteGitDeltaBundleScript(input: {
   remoteDir: string;
+  confined?: boolean;
+  sandboxCommand?: string;
   baseSha: string;
   exportRef: string;
   bundlePath: string;
@@ -735,7 +756,10 @@ export function buildRemoteGitDeltaBundleScript(input: {
    */
   forceFullBundle?: boolean;
 }): string {
-  const remoteDir = shellQuote(input.remoteDir);
+  const git = remoteGitCommand(input.remoteDir, {
+    confined: input.confined === true,
+    sandboxCommand: input.sandboxCommand,
+  });
   const bundlePath = shellQuote(input.bundlePath);
   const exportRef = shellQuote(input.exportRef);
   const baseSha = shellQuote(input.baseSha);
@@ -743,7 +767,7 @@ export function buildRemoteGitDeltaBundleScript(input: {
   const cleanupParts = [
     `rm -f ${bundlePath}`,
     ...(statusPath ? [`rm -f ${statusPath}`] : []),
-    `${REMOTE_GIT_COMMAND} -C ${remoteDir} update-ref -d ${exportRef} >/dev/null 2>&1 || true`,
+    `${git} update-ref -d ${exportRef} >/dev/null 2>&1 || true`,
   ];
   return [
     "set -e",
@@ -771,8 +795,8 @@ export function buildRemoteGitDeltaBundleScript(input: {
     ...(input.forceFullBundle
       ? [`bundle_base=""`]
       : [
-        `if ${REMOTE_GIT_COMMAND} -C ${remoteDir} cat-file -e ${baseSha}^{commit} 2>/dev/null; then`,
-        `  bundle_base=$(${REMOTE_GIT_COMMAND} -C ${remoteDir} merge-base ${baseSha} HEAD 2>/dev/null || true)`,
+        `if ${git} cat-file -e ${baseSha}^{commit} 2>/dev/null; then`,
+        `  bundle_base=$(${git} merge-base ${baseSha} HEAD 2>/dev/null || true)`,
         "else",
         `  bundle_base=""`,
         "fi",
@@ -780,27 +804,27 @@ export function buildRemoteGitDeltaBundleScript(input: {
     // An empty bundle means "still at baseSha" to the importer. A reset to an
     // older ancestor has no delta commits either, but must carry its new tip.
     // Use the full-bundle path so Git advertises that tip instead of losing it.
-    `if [ -n "$bundle_base" ] && [ "$bundle_base" != ${baseSha} ] && [ "$bundle_base" = "$(${REMOTE_GIT_COMMAND} -C ${remoteDir} rev-parse HEAD)" ]; then`,
+    `if [ -n "$bundle_base" ] && [ "$bundle_base" != ${baseSha} ] && [ "$bundle_base" = "$(${git} rev-parse HEAD)" ]; then`,
     `  bundle_base=""`,
     "fi",
     `if [ -n "$bundle_base" ]; then`,
-    `  commit_count=$(${REMOTE_GIT_COMMAND} -C ${remoteDir} rev-list --count HEAD --not "$bundle_base")`,
+    `  commit_count=$(${git} rev-list --count HEAD --not "$bundle_base")`,
     "else",
-    `  commit_count=$(${REMOTE_GIT_COMMAND} -C ${remoteDir} rev-list --count HEAD)`,
+    `  commit_count=$(${git} rev-list --count HEAD)`,
     "fi",
     'if [ "$commit_count" -gt 0 ]; then',
-    `  ${REMOTE_GIT_COMMAND} -C ${remoteDir} update-ref ${exportRef} HEAD`,
+    `  ${git} update-ref ${exportRef} HEAD`,
     `  if [ -n "$bundle_base" ]; then`,
-    `    ${REMOTE_GIT_COMMAND} -C ${remoteDir} bundle create ${bundlePath} ${exportRef} --not "$bundle_base" >/dev/null`,
+    `    ${git} bundle create ${bundlePath} ${exportRef} --not "$bundle_base" >/dev/null`,
     "  else",
-    `    ${REMOTE_GIT_COMMAND} -C ${remoteDir} bundle create ${bundlePath} ${exportRef} >/dev/null`,
+    `    ${git} bundle create ${bundlePath} ${exportRef} >/dev/null`,
     "  fi",
     "else",
     `  : > ${bundlePath}`,
     "fi",
     statusPath
       ? [
-        `${REMOTE_GIT_COMMAND} -C ${remoteDir} status --porcelain=v1 --untracked-files=normal -z > ${shellQuote(`${input.statusPath}.git-status`)}`,
+        `${git} status --porcelain=v1 --untracked-files=normal -z > ${shellQuote(`${input.statusPath}.git-status`)}`,
         `if [ ! -s ${shellQuote(`${input.statusPath}.git-status`)} ]; then`,
         `  printf clean > ${statusPath}`,
         "else",

@@ -911,42 +911,16 @@ try {
     "set -eu",
     '[ "$(uname -s)" = Linux ] || { echo "Remote process confinement requires Linux." >&2; exit 1; }',
     `command -v ${shellQuote(sandbox.command)} >/dev/null || { echo "Remote process confinement requires Bubblewrap." >&2; exit 1; }`,
-    // Reject workspace/home configurations (including symlink aliases) that
-    // would put login profiles inside a writable mount. These are sourced by
-    // later SSH commands outside the sandbox. Resolve protected-file aliases
-    // before writing anything, without a Node dependency for networkScope="deny".
+    // Keep the operator's home, system configuration and SSH credentials outside
+    // writable mounts. User profile aliases no longer matter: confined SSH
+    // commands source only the system profile.
     'remote_home=$(cd "$HOME" && pwd -P)',
-    'canonical_path() { realpath -- "$1" 2>/dev/null || readlink -f -- "$1" 2>/dev/null; }',
-    `repo_git_dir=${shellQuote(path.posix.join(input.target.remoteCwd, ".git"))}`,
-    'if [ -e "$repo_git_dir" ] || [ -L "$repo_git_dir" ]; then',
-    '  if [ ! -f "$repo_git_dir/config" ] || [ -L "$repo_git_dir/config" ]; then',
-    '    echo "Remote sandbox requires a regular workspace .git/config file." >&2; exit 1',
-    '  fi',
-    'fi',
     ...[input.target.remoteCwd, ...(input.options.managedPaths ?? [])
       .filter((managedPath) => managedPath.access === "rw").map((managedPath) => managedPath.path)]
       .map((writablePath) => [
         `writable_path=$(cd ${shellQuote(writablePath)} && pwd -P)`,
         'case "$remote_home/" in "$writable_path/"*) echo "Remote sandbox writable paths must not contain HOME." >&2; exit 1;; esac',
-        'case "$writable_path" in /|/etc|/etc/*|"$remote_home"/.profile|"$remote_home"/.profile/*|"$remote_home"/.bash_profile|"$remote_home"/.bash_profile/*|"$remote_home"/.bashrc|"$remote_home"/.bashrc/*|"$remote_home"/.zprofile|"$remote_home"/.zprofile/*|"$remote_home"/.ssh|"$remote_home"/.ssh/*) echo "Remote sandbox writable path overlaps login configuration." >&2; exit 1;; esac',
-        // Include the directories themselves (even when empty) and hidden entries.
-        'for protected_file in /etc/profile /etc/profile.d /etc/profile.d/* /etc/profile.d/.[!.]* /etc/profile.d/..?* "$remote_home/.profile" "$remote_home/.bash_profile" "$remote_home/.bashrc" "$remote_home/.zprofile" "$remote_home/.ssh" "$remote_home/.ssh/"* "$remote_home/.ssh/".[!.]* "$remote_home/.ssh/"..?*; do',
-        '  if [ ! -e "$protected_file" ] && [ ! -L "$protected_file" ]; then continue; fi',
-        // Canonicalise only the directory so an intermediate writable symlink
-        // cannot disappear when resolving the final target.
-        '  protected_path=$protected_file',
-        '  protected_hops=0',
-        '  while :; do',
-        '    protected_dir=$(canonical_path "$(dirname -- "$protected_path")") || { echo "Remote sandbox cannot resolve login configuration directory." >&2; exit 1; }',
-        '    protected_path="$protected_dir/$(basename -- "$protected_path")"',
-        '    case "$protected_path/" in "$writable_path/"*) echo "Remote sandbox writable path aliases login configuration." >&2; exit 1;; esac',
-        '    if [ ! -L "$protected_path" ]; then break; fi',
-        '    if [ "$protected_hops" -ge 40 ]; then echo "Remote sandbox login configuration symlink chain exceeds 40 hops." >&2; exit 1; fi',
-        '    protected_target=$(readlink -- "$protected_path") || { echo "Remote sandbox cannot read login configuration symlink." >&2; exit 1; }',
-        '    case "$protected_target" in /*) protected_path=$protected_target;; *) protected_path="$protected_dir/$protected_target";; esac',
-        '    protected_hops=$((protected_hops + 1))',
-        '  done',
-        'done',
+        'case "$writable_path" in /|/etc|/etc/*|"$remote_home"/.ssh|"$remote_home"/.ssh/*) echo "Remote sandbox writable path overlaps system or SSH configuration." >&2; exit 1;; esac',
       ].join("\n")),
   ];
   if (scripts.length > 0) {
@@ -1010,6 +984,10 @@ export async function runAdapterExecutionTargetProcess(
   args: string[],
   options: AdapterExecutionTargetProcessOptions,
 ): Promise<RunProcessResult> {
+  if (target?.kind === "remote" && target.transport === "ssh"
+      && (options.localProcessSandbox?.filesystemScope || options.localProcessSandbox?.networkScope)) {
+    target = { ...target, spec: { ...target.spec, confinedRun: true } };
+  }
   if (target?.kind === "remote" && target.transport === "sandbox") {
     const runner = requireSandboxRunner(target);
     const env = sanitizeRemoteExecutionEnv(options.env);

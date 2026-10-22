@@ -588,7 +588,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const { runId, agent, runtime, config, context, onLog, onMeta, onEvent, onSpawn, authToken } = ctx;
-  const executionTarget = readAdapterExecutionTarget({
+  let executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
@@ -608,6 +608,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
       },
     };
+  }
+  // Mark the entire SSH flow before credential probes, workspace sync or setup.
+  if (executionTarget?.kind === "remote" && executionTarget.transport === "ssh" && (filesystemScope || networkScope)) {
+    executionTarget = { ...executionTarget, spec: { ...executionTarget.spec, confinedRun: true } };
   }
 
   const promptTemplate = asString(
