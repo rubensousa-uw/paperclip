@@ -504,6 +504,12 @@ export function buildRemoteNetworkSandboxSpawnTarget(input: {
     }
     args.push(managedPath.access === "rw" ? "--bind" : "--ro-bind", managedDir, managedDir);
   }
+  // Host-side Git must never consume agent-written repo configuration or hooks.
+  // Keep objects, refs and the index writable so the agent can still commit.
+  for (const name of ["config", "hooks", "config.worktree"]) {
+    const gitPath = path.posix.join(cwd, ".git", name);
+    args.push(name === "config" ? "--ro-bind" : "--ro-bind-try", gitPath, gitPath);
+  }
   // Overlay this last even if the runtime is nested in a writable workspace.
   // Linux permits connect() to the socket on a read-only filesystem mount.
   if (input.options.networkScope === "allowlist") {

@@ -917,6 +917,12 @@ try {
     // before writing anything, without a Node dependency for networkScope="deny".
     'remote_home=$(cd "$HOME" && pwd -P)',
     'canonical_path() { realpath -- "$1" 2>/dev/null || readlink -f -- "$1" 2>/dev/null; }',
+    `repo_git_dir=${shellQuote(path.posix.join(input.target.remoteCwd, ".git"))}`,
+    'if [ -e "$repo_git_dir" ] || [ -L "$repo_git_dir" ]; then',
+    '  if [ ! -f "$repo_git_dir/config" ] || [ -L "$repo_git_dir/config" ]; then',
+    '    echo "Remote sandbox requires a regular workspace .git/config file." >&2; exit 1',
+    '  fi',
+    'fi',
     ...[input.target.remoteCwd, ...(input.options.managedPaths ?? [])
       .filter((managedPath) => managedPath.access === "rw").map((managedPath) => managedPath.path)]
       .map((writablePath) => [
@@ -926,8 +932,20 @@ try {
         // Include the directories themselves (even when empty) and hidden entries.
         'for protected_file in /etc/profile /etc/profile.d /etc/profile.d/* /etc/profile.d/.[!.]* /etc/profile.d/..?* "$remote_home/.profile" "$remote_home/.bash_profile" "$remote_home/.bashrc" "$remote_home/.zprofile" "$remote_home/.ssh" "$remote_home/.ssh/"* "$remote_home/.ssh/".[!.]* "$remote_home/.ssh/"..?*; do',
         '  if [ ! -e "$protected_file" ] && [ ! -L "$protected_file" ]; then continue; fi',
-        '  protected_path=$(canonical_path "$protected_file") || { echo "Remote sandbox requires realpath or readlink -f to resolve login configuration." >&2; exit 1; }',
-        '  case "$protected_path/" in "$writable_path/"*) echo "Remote sandbox writable path aliases login configuration." >&2; exit 1;; esac',
+        // Canonicalise only the directory so an intermediate writable symlink
+        // cannot disappear when resolving the final target.
+        '  protected_path=$protected_file',
+        '  protected_hops=0',
+        '  while :; do',
+        '    protected_dir=$(canonical_path "$(dirname -- "$protected_path")") || { echo "Remote sandbox cannot resolve login configuration directory." >&2; exit 1; }',
+        '    protected_path="$protected_dir/$(basename -- "$protected_path")"',
+        '    case "$protected_path/" in "$writable_path/"*) echo "Remote sandbox writable path aliases login configuration." >&2; exit 1;; esac',
+        '    if [ ! -L "$protected_path" ]; then break; fi',
+        '    if [ "$protected_hops" -ge 40 ]; then echo "Remote sandbox login configuration symlink chain exceeds 40 hops." >&2; exit 1; fi',
+        '    protected_target=$(readlink -- "$protected_path") || { echo "Remote sandbox cannot read login configuration symlink." >&2; exit 1; }',
+        '    case "$protected_target" in /*) protected_path=$protected_target;; *) protected_path="$protected_dir/$protected_target";; esac',
+        '    protected_hops=$((protected_hops + 1))',
+        '  done',
         'done',
       ].join("\n")),
   ];
