@@ -212,6 +212,25 @@ function parseTrustedNetworkUrl(value: string): NetworkAllowlistRule | null {
   }
 }
 
+function networkPolicyRules(input: {
+  networkAllowlist: string[];
+  networkTrustedUrls?: string[];
+}): NetworkAllowlistRule[] {
+  return [
+    ...input.networkAllowlist.map(parseNetworkAllowlistEntry),
+    ...(input.networkTrustedUrls ?? []).map(parseTrustedNetworkUrl)
+      .filter((rule): rule is NetworkAllowlistRule => rule !== null),
+  ];
+}
+
+export function isNetworkTargetAllowedByPolicy(
+  policy: { networkAllowlist: string[]; networkTrustedUrls?: string[] },
+  hostname: string,
+  port: string,
+): boolean {
+  return isNetworkTargetAllowed(hostname, port, networkPolicyRules(policy));
+}
+
 function writeProxyError(response: http.ServerResponse, status: number, code: string, message: string): void {
   const body = `${JSON.stringify({ error: { code, message } })}\n`;
   response.writeHead(status, {
@@ -238,10 +257,7 @@ async function startNetworkAllowlistProxy(
   socketPath: string,
 ): Promise<NetworkAllowlistProxy> {
   assertUnixSocketPathLength(socketPath);
-  const rules = [
-    ...allowlist.map(parseNetworkAllowlistEntry),
-    ...trustedUrls.map(parseTrustedNetworkUrl).filter((rule): rule is NetworkAllowlistRule => rule !== null),
-  ];
+  const rules = networkPolicyRules({ networkAllowlist: allowlist, networkTrustedUrls: trustedUrls });
   if (rules.length === 0) {
     throw new Error(
       'networkScope="allowlist" requires at least one valid networkAllowlist hostname or HTTP(S) networkTrustedUrl.',
@@ -328,11 +344,7 @@ export function buildRemoteNetworkAllowlistProxyScript(input: {
   networkAllowlist: string[];
   networkTrustedUrls?: string[];
 }): string {
-  const rules = [
-    ...input.networkAllowlist.map(parseNetworkAllowlistEntry),
-    ...(input.networkTrustedUrls ?? []).map(parseTrustedNetworkUrl)
-      .filter((rule): rule is NetworkAllowlistRule => rule !== null),
-  ];
+  const rules = networkPolicyRules(input);
   if (rules.length === 0) {
     throw new Error(
       'networkScope="allowlist" requires at least one valid networkAllowlist hostname or HTTP(S) networkTrustedUrl.',

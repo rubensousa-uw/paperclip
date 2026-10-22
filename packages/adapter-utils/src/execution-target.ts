@@ -913,15 +913,22 @@ try {
     `command -v ${shellQuote(sandbox.command)} >/dev/null || { echo "Remote process confinement requires Bubblewrap." >&2; exit 1; }`,
     // Reject workspace/home configurations (including symlink aliases) that
     // would put login profiles inside a writable mount. These are sourced by
-    // later SSH commands outside the sandbox. pwd -P needs no Node dependency
-    // for networkScope="deny".
+    // later SSH commands outside the sandbox. Resolve protected-file aliases
+    // before writing anything, without a Node dependency for networkScope="deny".
     'remote_home=$(cd "$HOME" && pwd -P)',
+    'canonical_path() { realpath -- "$1" 2>/dev/null || readlink -f -- "$1" 2>/dev/null; }',
     ...[input.target.remoteCwd, ...(input.options.managedPaths ?? [])
       .filter((managedPath) => managedPath.access === "rw").map((managedPath) => managedPath.path)]
       .map((writablePath) => [
         `writable_path=$(cd ${shellQuote(writablePath)} && pwd -P)`,
         'case "$remote_home/" in "$writable_path/"*) echo "Remote sandbox writable paths must not contain HOME." >&2; exit 1;; esac',
         'case "$writable_path" in /|/etc|/etc/*|"$remote_home"/.profile|"$remote_home"/.profile/*|"$remote_home"/.bash_profile|"$remote_home"/.bash_profile/*|"$remote_home"/.bashrc|"$remote_home"/.bashrc/*|"$remote_home"/.zprofile|"$remote_home"/.zprofile/*|"$remote_home"/.ssh|"$remote_home"/.ssh/*) echo "Remote sandbox writable path overlaps login configuration." >&2; exit 1;; esac',
+        // Include the directories themselves (even when empty) and hidden entries.
+        'for protected_file in /etc/profile /etc/profile.d /etc/profile.d/* /etc/profile.d/.[!.]* /etc/profile.d/..?* "$remote_home/.profile" "$remote_home/.bash_profile" "$remote_home/.bashrc" "$remote_home/.zprofile" "$remote_home/.ssh" "$remote_home/.ssh/"* "$remote_home/.ssh/".[!.]* "$remote_home/.ssh/"..?*; do',
+        '  if [ ! -e "$protected_file" ] && [ ! -L "$protected_file" ]; then continue; fi',
+        '  protected_path=$(canonical_path "$protected_file") || { echo "Remote sandbox requires realpath or readlink -f to resolve login configuration." >&2; exit 1; }',
+        '  case "$protected_path/" in "$writable_path/"*) echo "Remote sandbox writable path aliases login configuration." >&2; exit 1;; esac',
+        'done',
       ].join("\n")),
   ];
   if (scripts.length > 0) {
