@@ -11,7 +11,9 @@ import {
   parseLocalProcessNetworkScope,
   parseLocalProcessSandboxExtraPaths,
 } from "./local-process-sandbox.js";
+import * as sandboxModule from "./local-process-sandbox.js";
 import { runChildProcess } from "./server-utils.js";
+import { spawn } from "node:child_process";
 
 const cleanup: string[] = [];
 
@@ -450,4 +452,81 @@ function request(url) {
       }
     },
   );
+});
+
+/**
+ * ATDD (red) for the Factory v7 story 2.9, patch 2 (`feat(codex-local): network sandbox on SSH
+ * execution targets`). On an SSH target the allowlist proxy runs ON the target, placed by the
+ * remote prepare as a self-contained script. Contract asserted here:
+ * `buildRemoteNetworkAllowlistProxyScript({ networkAllowlist, networkTrustedUrls }) => string`
+ * returns Node.js source that only imports `node:` built-ins and, run as
+ * `node <script> <unixSocketPath>`, serves the same policy as the local proxy
+ * (CONNECT to a host outside the list → 403 `network_target_denied`).
+ */
+describe("remote network allowlist proxy script", () => {
+  const build = (sandboxModule as Record<string, unknown>).buildRemoteNetworkAllowlistProxyScript as
+    | ((input: { networkAllowlist: string[]; networkTrustedUrls?: string[] }) => string)
+    | undefined;
+
+  async function startScript(allowlist: string[]) {
+    expect(typeof build).toBe("function");
+    const source = build!({ networkAllowlist: allowlist, networkTrustedUrls: [] });
+    const dir = await fs.mkdtemp(path.join("/tmp", "pcp-rproxy-"));
+    cleanup.push(dir);
+    const scriptPath = path.join(dir, "proxy.mjs");
+    const socketPath = path.join(dir, "proxy.sock");
+    await fs.writeFile(scriptPath, source, "utf8");
+    const child = spawn(process.execPath, [scriptPath, socketPath], { stdio: "ignore" });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (await fs.stat(socketPath).then(() => true, () => false)) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return { source, socketPath, stop: () => child.kill("SIGKILL") };
+  }
+
+  function connectThrough(socketPath: string, target: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const socket = net.connect(socketPath);
+      let received = "";
+      socket.on("data", (chunk) => {
+        received += chunk.toString("utf8");
+        if (received.startsWith("HTTP/1.1 200") && received.includes("\r\n\r\n")) {
+          socket.destroy();
+          resolve(received);
+        }
+      });
+      socket.on("error", reject);
+      socket.on("close", () => resolve(received));
+      socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
+    });
+  }
+
+  it("is self-contained: only node: built-ins", async () => {
+    expect(typeof build).toBe("function");
+    const source = build!({ networkAllowlist: ["api.openai.com"], networkTrustedUrls: [] });
+    const specifiers = [
+      ...source.matchAll(/\bfrom\s+["']([^"']+)["']/g),
+      ...source.matchAll(/\brequire\(\s*["']([^"']+)["']\s*\)/g),
+      ...source.matchAll(/\bimport\(\s*["']([^"']+)["']\s*\)/g),
+    ].map((match) => match[1]);
+    expect(specifiers.length).toBeGreaterThan(0);
+    for (const specifier of specifiers) expect(specifier.startsWith("node:")).toBe(true);
+  });
+
+  it.runIf(process.platform === "linux")("denies a host outside the allowlist and allows a listed one", async () => {
+    const upstream = net.createServer((socket) => socket.end());
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", () => resolve()));
+    const port = (upstream.address() as net.AddressInfo).port;
+    const proxy = await startScript([`127.0.0.1:${port}`]);
+    try {
+      const denied = await connectThrough(proxy.socketPath, "denied.example:443");
+      expect(denied).toMatch(/^HTTP\/1\.1 403/);
+      expect(denied).toContain("network_target_denied");
+      const allowed = await connectThrough(proxy.socketPath, `127.0.0.1:${port}`);
+      expect(allowed).toMatch(/^HTTP\/1\.1 200/);
+    } finally {
+      proxy.stop();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  });
 });
