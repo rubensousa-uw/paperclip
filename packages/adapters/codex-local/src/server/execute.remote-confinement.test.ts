@@ -115,7 +115,14 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   return {
     ...actual,
     startAdapterExecutionTargetPaperclipBridge: mocks.startAdapterExecutionTargetPaperclipBridge,
-    prepareAdapterExecutionTargetRuntime: mocks.prepareAdapterExecutionTargetRuntime,
+    // Faked for the sandbox transport only; SSH goes through the real prepare, which ends in
+    // the mocked SSH helpers (prepareWorkspaceForSshExecution, syncDirectoryToSsh).
+    prepareAdapterExecutionTargetRuntime: vi.fn((...args: Parameters<typeof actual.prepareAdapterExecutionTargetRuntime>) => {
+      const target = (args[0] as { target?: { transport?: string } } | undefined)?.target;
+      return target?.transport === "sandbox"
+        ? mocks.prepareAdapterExecutionTargetRuntime(...(args as []))
+        : actual.prepareAdapterExecutionTargetRuntime(...args);
+    }),
     // Only the sandbox transport is faked; local and SSH go through the real runner, which
     // ends in the mocked runChildProcess (the fixture of execute.remote.test.ts).
     runAdapterExecutionTargetProcess: vi.fn((...args: Parameters<typeof actual.runAdapterExecutionTargetProcess>) => {
@@ -326,5 +333,48 @@ describe("codex confinement on remote execution targets", () => {
     } finally {
       if (original) mocks.runSshCommand.mockImplementation(original);
     }
+  });
+
+  // Fork review of ce523a92b, decision A/B at the codex boundary: a confined SSH run hands
+  // `confinedRun: true` to every SSH helper of its flow (workspace prepare/restore, directory
+  // sync, SSH commands, the spawn's remoteExecution); an unconfined run does not.
+  function specsSeen(): Array<{ via: string; confinedRun?: boolean }> {
+    const seen: Array<{ via: string; confinedRun?: boolean }> = [];
+    for (const [via, mock] of [
+      ["prepareWorkspaceForSshExecution", mocks.prepareWorkspaceForSshExecution],
+      ["restoreWorkspaceFromSshExecution", mocks.restoreWorkspaceFromSshExecution],
+      ["syncDirectoryToSsh", mocks.syncDirectoryToSsh],
+    ] as const) {
+      for (const call of mock.mock.calls) {
+        const spec = ((call as unknown[])[0] as { spec?: { confinedRun?: boolean } } | undefined)?.spec;
+        seen.push({ via, confinedRun: spec?.confinedRun });
+      }
+    }
+    for (const call of mocks.runSshCommand.mock.calls) {
+      seen.push({ via: "runSshCommand", confinedRun: ((call as unknown[])[0] as { confinedRun?: boolean })?.confinedRun });
+    }
+    for (const call of mocks.runChildProcess.mock.calls) {
+      const options = (call as unknown[])[3] as { remoteExecution?: { confinedRun?: boolean } | null };
+      seen.push({ via: "runChildProcess.remoteExecution", confinedRun: options?.remoteExecution?.confinedRun });
+    }
+    return seen;
+  }
+
+  it("marks every SSH helper of a confined run with confinedRun", async () => {
+    await run("ssh", { networkScope: "allowlist", networkAllowlist: ["api.openai.com"] });
+    const seen = specsSeen();
+    expect(seen.map((entry) => entry.via)).toEqual(expect.arrayContaining([
+      "prepareWorkspaceForSshExecution",
+      "syncDirectoryToSsh",
+      "runChildProcess.remoteExecution",
+    ]));
+    for (const entry of seen) expect(entry).toEqual({ via: entry.via, confinedRun: true });
+  });
+
+  it("does not mark an unconfined SSH run", async () => {
+    await run("ssh", {});
+    const seen = specsSeen();
+    expect(seen.length).toBeGreaterThan(0);
+    for (const entry of seen) expect(entry.confinedRun).not.toBe(true);
   });
 });
