@@ -2680,6 +2680,10 @@ export function agentRoutes(
     "cwd",
     "env",
     "filesystemSandboxCommand",
+    "filesystemScope",
+    "filesystemExtraPaths",
+    "networkScope",
+    "networkAllowlist",
   ] as const;
 
   const LOCAL_ADAPTER_CREDENTIAL_ENV_KEYS: Record<string, readonly string[]> = {
