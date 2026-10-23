@@ -2723,12 +2723,20 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
     allowPlainCredentials = false,
     harnessConfig = adapterConfig,
+    transition?: {
+      current: Record<string, unknown>;
+      resulting: Record<string, unknown>;
+    },
   ) {
     if (req.actor.type !== "agent" || (!adapterType.endsWith("_local") && adapterType !== "paperclip_runner")) return;
     const harness = agentHarnessType(adapterType, harnessConfig);
+    // Protect stored values even when a replacement or rollback omits them.
+    // New keys still use the presence rule, including its credential exception.
     const changedKeys = LOCAL_ADAPTER_HOST_COMMAND_KEYS.filter((key) =>
-      adapterConfig[key] !== undefined &&
-      (key !== "env" || !containsOnlyLocalAdapterCredentialRefs(harness, adapterConfig.env, allowPlainCredentials)),
+      (adapterConfig[key] !== undefined &&
+        (key !== "env" || !containsOnlyLocalAdapterCredentialRefs(harness, adapterConfig.env, allowPlainCredentials))) ||
+      (transition !== undefined && transition.current[key] !== undefined &&
+        !isDeepStrictEqual(transition.current[key], transition.resulting[key])),
     );
     if (changedKeys.length === 0) return;
     throw forbidden(
@@ -4340,6 +4348,14 @@ export function agentRoutes(
     if (req.actor.type === "agent" && rollbackAdapterConfig.homeMode !== asRecord(existing.adapterConfig)?.homeMode)
       throw forbidden("Only an operator can configure Runner homeMode.");
     assertNoAgentLocalAdapterHostCommandMutation(req, rollbackAdapterType, rollbackAdapterConfig);
+    assertNoAgentLocalAdapterHostCommandMutation(
+      req,
+      existing.adapterType.endsWith("_local") ? existing.adapterType : rollbackAdapterType,
+      {},
+      false,
+      rollbackAdapterConfig,
+      { current: asRecord(existing.adapterConfig) ?? {}, resulting: rollbackAdapterConfig },
+    );
     assertNoAgentProcessAdapterMutation(
       req,
       rollbackAdapterType,
@@ -5698,6 +5714,7 @@ export function agentRoutes(
           changingAdapterType ? rawEffectiveAdapterConfig : (requestedAdapterConfig ?? {}),
           false,
           rawEffectiveAdapterConfig,
+          { current: existingAdapterConfig, resulting: rawEffectiveAdapterConfig },
         );
       }
       const existingRunnerProvider =
@@ -5739,6 +5756,14 @@ export function agentRoutes(
         setupOnly: existing.lifecycleHolds?.includes("setup"),
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      assertNoAgentLocalAdapterHostCommandMutation(
+        req,
+        existing.adapterType.endsWith("_local") ? existing.adapterType : requestedAdapterType,
+        {},
+        false,
+        asRecord(patchData.adapterConfig) ?? {},
+        { current: existingAdapterConfig, resulting: asRecord(patchData.adapterConfig) ?? {} },
+      );
       assertExternalInstructionsAdmin(req, {
         ...existing,
         adapterConfig: patchData.adapterConfig,
