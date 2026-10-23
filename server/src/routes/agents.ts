@@ -38,6 +38,7 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
@@ -2622,11 +2623,19 @@ export function agentRoutes(
     adapterType: string,
     adapterConfig: Record<string, unknown>,
     allowPlainCredentials = false,
+    transition?: {
+      current: Record<string, unknown>;
+      resulting: Record<string, unknown>;
+    },
   ) {
     if (req.actor.type !== "agent" || !adapterType.endsWith("_local")) return;
+    // Protect stored values even when a replacement or rollback omits them.
+    // New keys still use the presence rule, including its credential exception.
     const changedKeys = LOCAL_ADAPTER_HOST_COMMAND_KEYS.filter((key) =>
-      adapterConfig[key] !== undefined &&
-      (key !== "env" || !containsOnlyLocalAdapterCredentialRefs(adapterType, adapterConfig.env, allowPlainCredentials)),
+      (adapterConfig[key] !== undefined &&
+        (key !== "env" || !containsOnlyLocalAdapterCredentialRefs(adapterType, adapterConfig.env, allowPlainCredentials))) ||
+      (transition !== undefined && transition.current[key] !== undefined &&
+        !isDeepStrictEqual(transition.current[key], transition.resulting[key])),
     );
     if (changedKeys.length === 0) return;
     throw forbidden(
@@ -4079,6 +4088,13 @@ export function agentRoutes(
     }
     assertNoAgentAdapterConfigMutation(req, rollbackAdapterConfig);
     assertNoAgentLocalAdapterHostCommandMutation(req, rollbackAdapterType, rollbackAdapterConfig);
+    assertNoAgentLocalAdapterHostCommandMutation(
+      req,
+      existing.adapterType.endsWith("_local") ? existing.adapterType : rollbackAdapterType,
+      {},
+      false,
+      { current: asRecord(existing.adapterConfig) ?? {}, resulting: rollbackAdapterConfig },
+    );
     assertNoAgentProcessAdapterMutation(
       req,
       rollbackAdapterType,
@@ -5270,6 +5286,8 @@ export function agentRoutes(
           req,
           requestedAdapterType,
           changingAdapterType ? rawEffectiveAdapterConfig : (requestedAdapterConfig ?? {}),
+          false,
+          { current: existingAdapterConfig, resulting: rawEffectiveAdapterConfig },
         );
       }
       const existingRunnerProvider =
@@ -5310,6 +5328,13 @@ export function agentRoutes(
         adapterConfig: effectiveAdapterConfig,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      assertNoAgentLocalAdapterHostCommandMutation(
+        req,
+        existing.adapterType.endsWith("_local") ? existing.adapterType : requestedAdapterType,
+        {},
+        false,
+        { current: existingAdapterConfig, resulting: asRecord(patchData.adapterConfig) ?? {} },
+      );
       assertExternalInstructionsAdmin(req, {
         ...existing,
         adapterConfig: patchData.adapterConfig,
