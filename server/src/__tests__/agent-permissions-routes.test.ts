@@ -1122,12 +1122,24 @@ describe("agent permission routes", () => {
     },
   );
 
-  it("still allows an agent replaceAdapterConfig that keeps every sandbox scope and changes only model", async () => {
+  it("blocks an agent replaceAdapterConfig that restates its sandbox scopes (presence rule kept)", async () => {
     mockAgentService.getById.mockResolvedValue(scopedAgent());
     const app = await createApp(selfAgentActor());
     const res = await requestApp(app, (baseUrl) => request(baseUrl)
       .patch(`/api/agents/${agentId}`)
       .send({ replaceAdapterConfig: true, adapterConfig: { ...SCOPED_ADAPTER_CONFIG, model: "gpt-5.4-mini" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("still allows an agent replaceAdapterConfig with only model when no sandbox scopes are set", async () => {
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "codex_local", adapterConfig: { model: "gpt-5.4" } });
+    const app = await createApp(selfAgentActor());
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ replaceAdapterConfig: true, adapterConfig: { model: "gpt-5.4-mini" } }));
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockAgentService.update).toHaveBeenCalledOnce();
@@ -1164,7 +1176,7 @@ describe("agent permission routes", () => {
     expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
 
-  it("still allows an agent rollback whose sandbox scopes equal the current ones", async () => {
+  it("blocks an agent rollback to a revision that carries sandbox scopes (presence rule kept)", async () => {
     const revisionId = "33333333-3333-4333-8333-333333333333";
     mockAgentService.getById.mockResolvedValue(scopedAgent());
     mockAgentService.getConfigRevision.mockResolvedValue({
@@ -1176,8 +1188,9 @@ describe("agent permission routes", () => {
     const res = await requestApp(app, (baseUrl) => request(baseUrl)
       .post(`/api/agents/${agentId}/config-revisions/${revisionId}/rollback`));
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalledOnce();
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
 
   it("still allows a board rollback of a scoped agent to a revision without scopes", async () => {
