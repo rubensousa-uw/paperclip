@@ -1004,6 +1004,73 @@ describe("agent permission routes", () => {
     expect(mockAgentService.update).toHaveBeenCalledOnce();
   });
 
+  // Upstream #16935: sandbox scope keys belong to the same class as filesystemSandboxCommand.
+  const SANDBOX_SCOPE_CASES = [
+    ["filesystemScope", { filesystemScope: "unrestricted" }],
+    ["filesystemExtraPaths", { filesystemExtraPaths: ["/"] }],
+    ["networkScope", { networkScope: "unrestricted" }],
+    ["networkAllowlist", { networkAllowlist: ["*"] }],
+  ] as const;
+
+  it.each(SANDBOX_SCOPE_CASES)(
+    "blocks a codex_local agent from changing its own sandbox %s",
+    async (_key, adapterConfig) => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "codex_local" });
+      const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toContain("host-executed local adapter settings");
+      expect(res.body.error).toContain(_key);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("blocks a claude_local agent from widening its own sandbox networkScope", async () => {
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
+    const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { engine: "cli", networkScope: "unrestricted" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("still allows a codex_local agent to change only its own model", async () => {
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "codex_local" });
+    const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { model: "gpt-5.4" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledOnce();
+  });
+
+  it.each(SANDBOX_SCOPE_CASES)(
+    "still allows a board user to change a codex_local agent's sandbox %s",
+    async (_key, adapterConfig) => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "codex_local" });
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "local_implicit",
+        isInstanceAdmin: true,
+        companyIds: [companyId],
+      });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentService.update).toHaveBeenCalledOnce();
+    },
+  );
+
   it("blocks an agent from activating inherited host settings by switching onto a local adapter", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...baseAgent,
