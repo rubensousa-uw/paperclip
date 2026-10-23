@@ -1081,6 +1081,131 @@ describe("agent permission routes", () => {
     },
   );
 
+  // Round 2 (#16935): the guard must compare protected keys between the current and resulting config.
+  const SCOPED_ADAPTER_CONFIG = {
+    model: "gpt-5.4",
+    filesystemScope: "workspace",
+    filesystemExtraPaths: ["/srv/shared"],
+    networkScope: "allowlist",
+    networkAllowlist: ["api.openai.com"],
+  };
+  const SCOPE_KEYS = ["filesystemScope", "filesystemExtraPaths", "networkScope", "networkAllowlist"] as const;
+  const scopedAgent = () => ({ ...baseAgent, adapterType: "codex_local", adapterConfig: { ...SCOPED_ADAPTER_CONFIG } });
+  const selfAgentActor = () => ({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+  const adminBoardActor = () => ({
+    type: "board",
+    userId: "board-user",
+    source: "local_implicit",
+    isInstanceAdmin: true,
+    companyIds: [companyId],
+  });
+  const withoutKey = (key: string) => {
+    const { [key]: _removed, ...rest } = SCOPED_ADAPTER_CONFIG as Record<string, unknown>;
+    return rest;
+  };
+
+  it("blocks an agent from wiping its own sandbox scopes with an empty replaceAdapterConfig", async () => {
+    mockAgentService.getById.mockResolvedValue(scopedAgent());
+    const app = await createApp(selfAgentActor());
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ replaceAdapterConfig: true, adapterConfig: {} }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it.each(SCOPE_KEYS)(
+    "blocks an agent from dropping its own sandbox %s via replaceAdapterConfig",
+    async (key) => {
+      mockAgentService.getById.mockResolvedValue(scopedAgent());
+      const app = await createApp(selfAgentActor());
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ replaceAdapterConfig: true, adapterConfig: withoutKey(key) }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toContain("host-executed local adapter settings");
+      expect(res.body.error).toContain(key);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("still allows an agent replaceAdapterConfig that keeps every sandbox scope and changes only model", async () => {
+    mockAgentService.getById.mockResolvedValue(scopedAgent());
+    const app = await createApp(selfAgentActor());
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ replaceAdapterConfig: true, adapterConfig: { ...SCOPED_ADAPTER_CONFIG, model: "gpt-5.4-mini" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledOnce();
+  });
+
+  it("still allows a board user to replace a scoped agent's adapterConfig with {}", async () => {
+    mockAgentService.getById.mockResolvedValue(scopedAgent());
+    const app = await createApp(adminBoardActor());
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ replaceAdapterConfig: true, adapterConfig: {} }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["a revision without sandbox scopes", { model: "gpt-5.4" }],
+    ["a revision with a different networkAllowlist", { ...SCOPED_ADAPTER_CONFIG, networkAllowlist: ["*"] }],
+  ])("blocks an agent from rolling itself back to %s", async (_label, adapterConfig) => {
+    const revisionId = "33333333-3333-4333-8333-333333333333";
+    mockAgentService.getById.mockResolvedValue(scopedAgent());
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: revisionId,
+      afterConfig: { adapterType: "codex_local", adapterConfig, runtimeConfig: {} },
+    });
+    mockAgentService.rollbackConfigRevision.mockResolvedValue(scopedAgent());
+    const app = await createApp(selfAgentActor());
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/config-revisions/${revisionId}/rollback`));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+  });
+
+  it("still allows an agent rollback whose sandbox scopes equal the current ones", async () => {
+    const revisionId = "33333333-3333-4333-8333-333333333333";
+    mockAgentService.getById.mockResolvedValue(scopedAgent());
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: revisionId,
+      afterConfig: { adapterType: "codex_local", adapterConfig: { ...SCOPED_ADAPTER_CONFIG, model: "gpt-5.4-mini" }, runtimeConfig: {} },
+    });
+    mockAgentService.rollbackConfigRevision.mockResolvedValue(scopedAgent());
+    const app = await createApp(selfAgentActor());
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/config-revisions/${revisionId}/rollback`));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalledOnce();
+  });
+
+  it("still allows a board rollback of a scoped agent to a revision without scopes", async () => {
+    const revisionId = "33333333-3333-4333-8333-333333333333";
+    mockAgentService.getById.mockResolvedValue(scopedAgent());
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: revisionId,
+      afterConfig: { adapterType: "codex_local", adapterConfig: { model: "gpt-5.4" }, runtimeConfig: {} },
+    });
+    mockAgentService.rollbackConfigRevision.mockResolvedValue(scopedAgent());
+    const app = await createApp(adminBoardActor());
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/config-revisions/${revisionId}/rollback`));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalledOnce();
+  });
+
   it("blocks an agent from activating inherited host settings by switching onto a local adapter", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...baseAgent,
