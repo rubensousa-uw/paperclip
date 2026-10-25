@@ -9,6 +9,7 @@ import {
   connectionIntentDeliveries,
   heartbeatRuns,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueComments,
   issues,
 } from "@paperclipai/db";
