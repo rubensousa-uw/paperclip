@@ -26,6 +26,7 @@ import {
   connectionIntentDeliveries,
   heartbeatRuns,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueComments,
   issueTreeHolds,
   issues,
