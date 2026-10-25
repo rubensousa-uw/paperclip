@@ -12,6 +12,7 @@ import {
   connectionIntentDeliveries,
   heartbeatRuns,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueComments,
   issues,
   nativeRunFinalizations,
