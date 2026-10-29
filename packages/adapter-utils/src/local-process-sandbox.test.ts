@@ -3,7 +3,7 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildLocalProcessSandboxSpawnTarget,
   parseLocalProcessFilesystemScope,
@@ -27,6 +27,7 @@ async function withTmpDir<T>(tmpDir: string, run: () => Promise<T>): Promise<T> 
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(cleanup.splice(0).map((candidate) => fs.rm(candidate, { recursive: true, force: true })));
 });
 
@@ -167,10 +168,33 @@ describe("local process sandbox", () => {
     })).rejects.toThrow(`Writable sandbox managed path "${managed}" overlaps read-only workspace "${workspaceDir}"`);
   });
 
-  it.runIf(process.platform === "linux")("fails closed when a writable managed path cannot be resolved", async () => {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-missing-"));
-    cleanup.push(workspace);
-    const missing = `${workspace}-missing`;
+  it.runIf(process.platform === "linux")("allows missing writable managed paths outside the workspace", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-missing-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const missing = path.join(root, "missing", "config");
+    await fs.mkdir(workspace);
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace-read-only",
+        managedPaths: [missing, path.join(root, ".claude.json")].map((candidate) => ({ path: candidate, access: "rw" })),
+      },
+    });
+    expect(target.args).toEqual(expect.arrayContaining(["--ro-bind", workspace, workspace]));
+    expect(target.args).not.toContain(missing);
+    await expect(fs.lstat(missing)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.runIf(process.platform === "linux").each([false, true])("rejects missing writable managed paths inside the workspace (symlink: %s)", async (symlink) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-missing-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const alias = path.join(root, "alias");
+    await fs.mkdir(workspace);
+    if (symlink) await fs.symlink(workspace, alias);
+    const missing = path.join(symlink ? alias : workspace, "missing", "config");
     await expect(buildLocalProcessSandboxSpawnTarget({
       executable: process.execPath, args: [], cwd: workspace,
       options: {
@@ -178,7 +202,87 @@ describe("local process sandbox", () => {
         filesystemScope: "workspace-read-only",
         managedPaths: [{ path: missing, access: "rw" }],
       },
-    })).rejects.toThrow(`Cannot resolve sandbox path "${missing}"`);
+    })).rejects.toThrow(`Writable sandbox managed path "${missing}" overlaps read-only workspace "${workspace}"`);
+  });
+
+  it.runIf(process.platform === "linux").each(["equal", "ancestor", "descendant"])("rejects missing managed overlap with a missing workspace through a symlink (%s)", async (relationship) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-missing-"));
+    cleanup.push(root);
+    const alias = path.join(root, "alias");
+    await fs.symlink(root, alias);
+    const workspace = path.join(alias, "missing", "workspace");
+    const managed = path.join(root, "missing", ...(relationship === "ancestor" ? [] : ["workspace"]), ...(relationship === "descendant" ? ["child"] : []));
+    await expect(buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace-read-only",
+        managedPaths: [{ path: managed, access: "rw" }],
+      },
+    })).rejects.toThrow(`Writable sandbox managed path "${managed}" overlaps read-only workspace "${workspace}"`);
+  });
+
+  it.runIf(process.platform === "linux").each(["file-parent", "dangling-symlink"])("rejects unresolvable writable managed paths (%s)", async (kind) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-unresolvable-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const outside = path.join(root, "outside");
+    await fs.mkdir(workspace);
+    if (kind === "file-parent") await fs.writeFile(outside, "file");
+    else await fs.symlink(path.join(workspace, "missing"), outside);
+    const managed = kind === "file-parent" ? path.join(outside, "config") : outside;
+    await expect(buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace-read-only",
+        managedPaths: [{ path: managed, access: "rw" }],
+      },
+    })).rejects.toThrow(`Cannot resolve sandbox path "${managed}"`);
+  });
+
+  it.runIf(process.platform === "linux").each([false, true])("rejects proxy storage inside a read-only /tmp workspace and cleans up (symlink: %s)", async (symlink) => {
+    const root = await fs.mkdtemp(path.join("/tmp", "pc-ro-proxy-"));
+    cleanup.push(root);
+    const alias = path.join(root, "alias");
+    if (symlink) await fs.symlink("/tmp", alias);
+    const workspace = symlink ? alias : "/tmp";
+    const mkdtemp = vi.spyOn(fs, "mkdtemp");
+    const createServer = vi.spyOn(http, "createServer");
+    const pending = buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: workspace,
+      options: { workspaceDir: workspace, filesystemScope: "workspace-read-only", networkScope: "allowlist", networkAllowlist: ["example.com"] },
+    });
+    try {
+      await expect(pending).rejects.toThrow(/Writable sandbox proxy directory ".*" overlaps read-only workspace/);
+      expect(mkdtemp).toHaveBeenCalledOnce();
+      const tempDir = await mkdtemp.mock.results[0].value;
+      expect(tempDir).toMatch(/^\/tmp\/paperclip-network-sandbox-/);
+      expect(createServer).not.toHaveBeenCalled();
+      await expect(fs.lstat(tempDir)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await pending.then((target) => target.cleanup?.(), () => undefined);
+    }
+  });
+
+  it.runIf(process.platform === "linux").each(["equal", "ancestor"])("rejects a proxy directory %s to a read-only workspace and cleans up", async (relationship) => {
+    const tempDir = await fs.mkdtemp(path.join("/tmp", "pc-ro-proxy-"));
+    cleanup.push(tempDir);
+    const workspace = relationship === "equal" ? tempDir : path.join(tempDir, "workspace");
+    if (relationship === "ancestor") await fs.mkdir(workspace);
+    vi.spyOn(fs, "mkdtemp").mockResolvedValueOnce(tempDir);
+    const createServer = vi.spyOn(http, "createServer");
+    const pending = buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: workspace,
+      options: { workspaceDir: workspace, filesystemScope: "workspace-read-only", networkScope: "allowlist", networkAllowlist: ["example.com"] },
+    });
+    try {
+      await expect(pending).rejects.toThrow(`Writable sandbox proxy directory "${tempDir}" overlaps read-only workspace "${workspace}"`);
+      expect(createServer).not.toHaveBeenCalled();
+      await expect(fs.lstat(tempDir)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await pending.then((target) => target.cleanup?.(), () => undefined);
+    }
   });
 
   it.runIf(process.platform === "linux")("requires cwd inside a read-only workspace", async () => {
