@@ -166,6 +166,18 @@ function pathsOverlap(left: string, right: string): boolean {
     relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
+async function resolveSandboxPath(candidate: string): Promise<string> {
+  try {
+    return await fs.realpath(candidate);
+  } catch (error) {
+    const parent = path.dirname(candidate);
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && parent !== candidate && !(await pathExists(candidate))) {
+      return path.join(await resolveSandboxPath(parent), path.basename(candidate));
+    }
+    throw new Error(`Cannot resolve sandbox path "${candidate}" for filesystemScope="workspace-read-only".`, { cause: error });
+  }
+}
+
 function isNetworkTargetAllowed(hostname: string, port: string, rules: NetworkAllowlistRule[]): boolean {
   const normalizedHostname = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   return rules.some((rule) => rule.hostname === normalizedHostname && (rule.port === null || rule.port === port));
@@ -360,6 +372,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   const workspaceDir = normalizeAbsolutePath(input.options.workspaceDir, "Sandbox workspaceDir");
   const cwd = normalizeAbsolutePath(input.cwd, "Sandbox cwd");
   const readOnlyWorkspace = filesystemScope === "workspace-read-only";
+  const canonicalWorkspaceDir = readOnlyWorkspace ? await resolveSandboxPath(workspaceDir) : workspaceDir;
   if (filesystemScope) {
     const relativeCwd = path.relative(workspaceDir, cwd);
     if (relativeCwd.startsWith("..") || path.isAbsolute(relativeCwd)) {
@@ -389,14 +402,11 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       if (outboundRestorePaths.length > 0) {
         throw new Error(`Sandbox outbound restore path "${outboundRestorePaths[0]}" is not allowed with filesystemScope="workspace-read-only".`);
       }
-      const resolvePath = (candidate: string) => fs.realpath(candidate).catch((error) => {
-        throw new Error(`Cannot resolve sandbox path "${candidate}" for filesystemScope="workspace-read-only".`, { cause: error });
-      });
       for (const [index, managedPath] of (input.options.managedPaths ?? []).entries()) {
         if (managedPath.access !== "rw") continue;
         const normalizedManagedPath = normalizeAbsolutePath(managedPath.path, `Sandbox managedPaths[${index}].path`);
         if (pathsOverlap(workspaceDir, normalizedManagedPath)
-          || pathsOverlap(await resolvePath(workspaceDir), await resolvePath(normalizedManagedPath))) {
+          || pathsOverlap(canonicalWorkspaceDir, await resolveSandboxPath(normalizedManagedPath))) {
           throw new Error(`Writable sandbox managed path "${normalizedManagedPath}" overlaps read-only workspace "${workspaceDir}".`);
         }
       }
@@ -457,15 +467,23 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       const tempDir = await createNetworkProxyTempDir();
       const socketPath = path.join(tempDir, "proxy.sock");
       const bridgePath = path.join(tempDir, "bridge.cjs");
-      await fs.writeFile(bridgePath, await createNetworkProxyBridge(), { mode: 0o500 });
-      const proxy = await startNetworkAllowlistProxy(
-        input.options.networkAllowlist ?? [],
-        input.options.networkTrustedUrls ?? [],
-        socketPath,
-      ).catch(async (error) => {
+      let proxy: NetworkAllowlistProxy;
+      try {
+        const normalizedTempDir = normalizeAbsolutePath(tempDir, "Sandbox proxy directory");
+        if (readOnlyWorkspace && (pathsOverlap(workspaceDir, normalizedTempDir)
+          || pathsOverlap(canonicalWorkspaceDir, await resolveSandboxPath(normalizedTempDir)))) {
+          throw new Error(`Writable sandbox proxy directory "${normalizedTempDir}" overlaps read-only workspace "${workspaceDir}".`);
+        }
+        await fs.writeFile(bridgePath, await createNetworkProxyBridge(), { mode: 0o500 });
+        proxy = await startNetworkAllowlistProxy(
+          input.options.networkAllowlist ?? [],
+          input.options.networkTrustedUrls ?? [],
+          socketPath,
+        );
+      } catch (error) {
         await fs.rm(tempDir, { recursive: true, force: true });
         throw error;
-      });
+      }
       await mount(tempDir, "rw");
       executable = process.execPath;
       executableArgs = [bridgePath, socketPath, input.executable, ...input.args];
