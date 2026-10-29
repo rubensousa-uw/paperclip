@@ -333,10 +333,10 @@ describe("codex_local ACP lane", () => {
     ).resolves.toMatchObject({ engine: "acp", explicit: true, unavailableReason: expect.stringContaining("Node") });
   });
 
-  it("requires explicit CLI selection for local filesystem or network scope", async () => {
+  it.each(["workspace", "workspace-read-only"])("requires explicit CLI selection for local filesystem or network scope (%s)", async (filesystemScope) => {
     await expect(
       resolveCodexExecutionEngineForRun({
-        config: { filesystemScope: "workspace" },
+        config: { filesystemScope },
         executionTarget: null,
       }),
     ).resolves.toMatchObject({
@@ -346,7 +346,7 @@ describe("codex_local ACP lane", () => {
     });
     await expect(
       resolveCodexExecutionEngineForRun({
-        config: { engine: "acp", filesystemScope: "workspace" },
+        config: { engine: "acp", filesystemScope },
         executionTarget: null,
       }),
     ).resolves.toMatchObject({ engine: "acp", unavailableReason: expect.stringContaining("ACP confinement is not supported") });
