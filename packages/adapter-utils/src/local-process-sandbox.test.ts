@@ -59,6 +59,137 @@ describe("local process sandbox", () => {
     expect(() => parseLocalProcessNetworkScope("public")).toThrow('"deny" or "allowlist"');
   });
 
+  it("parses the read-only workspace scope and describes both valid values", () => {
+    expect(parseLocalProcessFilesystemScope("workspace-read-only")).toBe("workspace-read-only");
+    for (const value of ["read-only", "workpace", true, 1, {}]) {
+      expect(() => parseLocalProcessFilesystemScope(value))
+        .toThrow('filesystemScope must be "workspace" or "workspace-read-only".');
+    }
+  });
+
+  it.runIf(process.platform === "linux")("mounts the read-only workspace and aliases while preserving writable CLI home", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const managedHome = path.join(root, "workspace-home");
+    const extra = path.join(root, "extra");
+    await Promise.all([workspace, managedHome, extra].map((directory) => fs.mkdir(directory)));
+
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace-read-only",
+        managedPaths: [{ path: managedHome, access: "rw" }],
+        extraPaths: [{ path: extra, access: "ro" }],
+        pathAliases: [{ path: "/app", target: workspace }],
+        homeDir: managedHome,
+      },
+    });
+
+    const mounts = target.args.flatMap((arg, index) =>
+      arg === "--bind" || arg === "--ro-bind" ? [target.args.slice(index, index + 3)] : []);
+    expect(mounts).toContainEqual(["--ro-bind", workspace, workspace]);
+    expect(mounts).not.toContainEqual(["--bind", workspace, workspace]);
+    expect(mounts).toContainEqual(["--ro-bind", workspace, "/app"]);
+    expect(mounts).not.toContainEqual(["--bind", workspace, "/app"]);
+    expect(mounts).toContainEqual(["--bind", managedHome, managedHome]);
+    expect(mounts).toContainEqual(["--ro-bind", extra, extra]);
+    expect(target.args.slice(5, 15)).toEqual(["--tmpfs", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--symlink", "usr/bin"]);
+  });
+
+  it.runIf(process.platform === "linux").each([false, true])("rejects writable extra paths in read-only scope (restored: %s)", async (restored) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-extra-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const extra = restored ? path.join(root, "outside") : workspace;
+    await fs.mkdir(workspace);
+
+    await expect(buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace-read-only",
+        extraPaths: [{ path: extra, access: "rw" }],
+        outboundRestorePaths: restored ? [extra] : [],
+      },
+    })).rejects.toThrow(`Writable sandbox extra path "${extra}" is not allowed`);
+  });
+
+  it.runIf(process.platform === "linux")("rejects outbound restore paths in read-only scope", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-restore-"));
+    cleanup.push(workspace);
+    await expect(buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: workspace,
+      options: { workspaceDir: workspace, filesystemScope: "workspace-read-only", outboundRestorePaths: [workspace] },
+    })).rejects.toThrow(`Sandbox outbound restore path "${workspace}" is not allowed`);
+  });
+
+  it.runIf(process.platform === "linux").each(["equal", "ancestor", "descendant"])("rejects a writable managed path %s to the workspace", async (relationship) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-managed-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const child = path.join(workspace, "child");
+    await fs.mkdir(child, { recursive: true });
+    const managed = relationship === "equal" ? workspace : relationship === "ancestor" ? root : child;
+
+    await expect(buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace-read-only",
+        managedPaths: [{ path: path.join(managed, "."), access: "rw" }],
+      },
+    })).rejects.toThrow(`Writable sandbox managed path "${managed}" overlaps read-only workspace "${workspace}"`);
+  });
+
+  it.runIf(process.platform === "linux").each(["equal", "ancestor", "descendant", "workspace-alias"])("rejects writable managed overlap through symlinks (%s)", async (relationship) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-symlink-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const child = path.join(workspace, "child");
+    const alias = path.join(root, "alias");
+    await fs.mkdir(child, { recursive: true });
+    const target = relationship === "ancestor" ? root : relationship === "descendant" ? child : workspace;
+    await fs.symlink(target, alias);
+    const workspaceDir = relationship === "workspace-alias" ? alias : workspace;
+    const managed = relationship === "workspace-alias" ? child : alias;
+
+    await expect(buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: workspaceDir,
+      options: {
+        workspaceDir,
+        filesystemScope: "workspace-read-only",
+        managedPaths: [{ path: managed, access: "rw" }],
+      },
+    })).rejects.toThrow(`Writable sandbox managed path "${managed}" overlaps read-only workspace "${workspaceDir}"`);
+  });
+
+  it.runIf(process.platform === "linux")("fails closed when a writable managed path cannot be resolved", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-missing-"));
+    cleanup.push(workspace);
+    const missing = `${workspace}-missing`;
+    await expect(buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace-read-only",
+        managedPaths: [{ path: missing, access: "rw" }],
+      },
+    })).rejects.toThrow(`Cannot resolve sandbox path "${missing}"`);
+  });
+
+  it.runIf(process.platform === "linux")("requires cwd inside a read-only workspace", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-cwd-"));
+    cleanup.push(workspace);
+    await expect(buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: [], cwd: path.dirname(workspace),
+      options: { workspaceDir: workspace, filesystemScope: "workspace-read-only" },
+    })).rejects.toThrow("must be inside workspaceDir");
+  });
+
   it.runIf(process.platform === "linux")("describes every valid allowlist input when no proxy rules remain", async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-rules-"));
     cleanup.push(workspace);
@@ -308,6 +439,54 @@ describe("local process sandbox", () => {
       }),
     ).rejects.toThrow("requires Bubblewrap");
   });
+
+  it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(
+    "reads a read-only workspace, rejects writes with EROFS, and keeps tmp writes ephemeral",
+    async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-read-only-integration-"));
+      cleanup.push(root);
+      const workspace = path.join(root, "workspace");
+      const managedHome = path.join(root, "managed-home");
+      const tmpFile = path.join("/tmp", `${path.basename(root)}.txt`);
+      cleanup.push(tmpFile);
+      await Promise.all([workspace, managedHome].map((directory) => fs.mkdir(directory)));
+      await fs.writeFile(path.join(workspace, "input.txt"), "readable");
+      await expect(fs.stat(tmpFile)).rejects.toMatchObject({ code: "ENOENT" });
+
+      const script = [
+        "const fs = require('node:fs');",
+        "if (fs.readFileSync('input.txt', 'utf8') !== 'readable') process.exit(9);",
+        "for (const file of ['input.txt', 'new.txt', '/app/input.txt', '/app/new.txt']) {",
+        "  try { fs.writeFileSync(file, 'changed'); process.exit(8); } catch (error) {",
+        "    if (error.code !== 'EROFS') throw error;",
+        "  }",
+        "}",
+        `fs.writeFileSync(${JSON.stringify(path.join(managedHome, "cli-state.txt"))}, 'state');`,
+        `fs.writeFileSync(${JSON.stringify(tmpFile)}, 'ephemeral');`,
+        `if (fs.readFileSync(${JSON.stringify(tmpFile)}, 'utf8') !== 'ephemeral') process.exit(7);`,
+      ].join("\n");
+      const result = await runChildProcess("filesystem-read-only-sandbox-test", process.execPath, ["-e", script], {
+        cwd: workspace,
+        env: {},
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+        localProcessSandbox: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace-read-only",
+          managedPaths: [{ path: managedHome, access: "rw" }],
+          pathAliases: [{ path: "/app", target: workspace }],
+          command: process.env.PAPERCLIP_TEST_BWRAP,
+        },
+      });
+
+      expect(result.exitCode, result.stderr).toBe(0);
+      await expect(fs.readFile(path.join(workspace, "input.txt"), "utf8")).resolves.toBe("readable");
+      await expect(fs.stat(path.join(workspace, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.readFile(path.join(managedHome, "cli-state.txt"), "utf8")).resolves.toBe("state");
+      await expect(fs.stat(tmpFile)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
 
   it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(
     "prevents reads outside the workspace while allowing workspace writes",

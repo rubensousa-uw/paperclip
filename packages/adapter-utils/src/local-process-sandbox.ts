@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 export type LocalProcessSandboxAccess = "ro" | "rw";
+export type LocalProcessFilesystemScope = "workspace" | "workspace-read-only";
 export type LocalProcessNetworkScope = "deny" | "allowlist";
 
 export interface LocalProcessSandboxPath {
@@ -19,7 +20,7 @@ export interface LocalProcessSandboxPathAlias {
 
 export interface LocalProcessSandboxOptions {
   workspaceDir: string;
-  filesystemScope?: "workspace" | null;
+  filesystemScope?: LocalProcessFilesystemScope | null;
   managedPaths?: LocalProcessSandboxPath[];
   extraPaths?: LocalProcessSandboxPath[];
   pathAliases?: LocalProcessSandboxPathAlias[];
@@ -154,10 +155,15 @@ export function parseLocalProcessNetworkScope(value: unknown): LocalProcessNetwo
   throw new Error('networkScope must be "deny" or "allowlist".');
 }
 
-export function parseLocalProcessFilesystemScope(value: unknown): "workspace" | null {
+export function parseLocalProcessFilesystemScope(value: unknown): LocalProcessFilesystemScope | null {
   if (value == null || value === "") return null;
-  if (value === "workspace") return value;
-  throw new Error('filesystemScope must be "workspace".');
+  if (value === "workspace" || value === "workspace-read-only") return value;
+  throw new Error('filesystemScope must be "workspace" or "workspace-read-only".');
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  return [path.relative(left, right), path.relative(right, left)].some((relative) =>
+    relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function isNetworkTargetAllowed(hostname: string, port: string, rules: NetworkAllowlistRule[]): boolean {
@@ -353,7 +359,8 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
 
   const workspaceDir = normalizeAbsolutePath(input.options.workspaceDir, "Sandbox workspaceDir");
   const cwd = normalizeAbsolutePath(input.cwd, "Sandbox cwd");
-  if (filesystemScope === "workspace") {
+  const readOnlyWorkspace = filesystemScope === "workspace-read-only";
+  if (filesystemScope) {
     const relativeCwd = path.relative(workspaceDir, cwd);
     if (relativeCwd.startsWith("..") || path.isAbsolute(relativeCwd)) {
       throw new Error(`Sandbox cwd "${cwd}" must be inside workspaceDir "${workspaceDir}".`);
@@ -363,6 +370,9 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     for (const [index, extraPath] of (input.options.extraPaths ?? []).entries()) {
       if (extraPath.access !== "rw") continue;
       const normalizedExtraPath = normalizeAbsolutePath(extraPath.path, `Sandbox extraPaths[${index}].path`);
+      if (readOnlyWorkspace) {
+        throw new Error(`Writable sandbox extra path "${normalizedExtraPath}" is not allowed with filesystemScope="workspace-read-only".`);
+      }
       const relativeToWorkspace = path.relative(workspaceDir, normalizedExtraPath);
       const synchronized = !relativeToWorkspace.startsWith("..") && !path.isAbsolute(relativeToWorkspace);
       const restored = outboundRestorePaths.some((restorePath) => {
@@ -375,6 +385,22 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
         );
       }
     }
+    if (readOnlyWorkspace) {
+      if (outboundRestorePaths.length > 0) {
+        throw new Error(`Sandbox outbound restore path "${outboundRestorePaths[0]}" is not allowed with filesystemScope="workspace-read-only".`);
+      }
+      const resolvePath = (candidate: string) => fs.realpath(candidate).catch((error) => {
+        throw new Error(`Cannot resolve sandbox path "${candidate}" for filesystemScope="workspace-read-only".`, { cause: error });
+      });
+      for (const [index, managedPath] of (input.options.managedPaths ?? []).entries()) {
+        if (managedPath.access !== "rw") continue;
+        const normalizedManagedPath = normalizeAbsolutePath(managedPath.path, `Sandbox managedPaths[${index}].path`);
+        if (pathsOverlap(workspaceDir, normalizedManagedPath)
+          || pathsOverlap(await resolvePath(workspaceDir), await resolvePath(normalizedManagedPath))) {
+          throw new Error(`Writable sandbox managed path "${normalizedManagedPath}" overlaps read-only workspace "${workspaceDir}".`);
+        }
+      }
+    }
   }
 
   const bwrapCommand = input.options.command?.trim() || "bwrap";
@@ -384,7 +410,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   let executable = input.executable;
   let executableArgs = input.args;
 
-  if (filesystemScope === "workspace") {
+  if (filesystemScope) {
     args.push("--tmpfs", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp");
     const created = new Set<string>(["/", "/proc", "/dev", "/tmp"]);
     const mounted = new Set<string>();
@@ -415,7 +441,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     }
     for (const managedPath of input.options.managedPaths ?? []) await mount(managedPath.path, managedPath.access);
     for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
-    await mount(workspaceDir, "rw");
+    await mount(workspaceDir, readOnlyWorkspace ? "ro" : "rw");
     for (const [index, alias] of (input.options.pathAliases ?? []).entries()) {
       const aliasPath = normalizeAbsolutePath(alias.path, `Sandbox pathAliases[${index}].path`);
       const aliasTarget = normalizeAbsolutePath(alias.target, `Sandbox pathAliases[${index}].target`);
@@ -429,7 +455,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
         throw new Error(`Sandbox path alias target "${aliasTarget}" does not exist.`);
       }
       addParentDirectories(args, created, aliasPath);
-      args.push("--bind", aliasTarget, aliasPath);
+      args.push(readOnlyWorkspace ? "--ro-bind" : "--bind", aliasTarget, aliasPath);
       created.add(aliasPath);
     }
 

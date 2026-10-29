@@ -597,7 +597,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
   if (localProcessSandbox) {
     if (filesystemScope) env.CLAUDE_CONFIG_DIR = sharedClaudeConfigDir;
-    const scopes = [filesystemScope ? "workspace filesystem" : null, networkScope ? `${networkScope} network` : null]
+    const scopes = [filesystemScope === "workspace-read-only" ? "read-only workspace filesystem" : filesystemScope ? "workspace filesystem" : null, networkScope ? `${networkScope} network` : null]
       .filter(Boolean)
       .join(" and ");
     await onLog(
