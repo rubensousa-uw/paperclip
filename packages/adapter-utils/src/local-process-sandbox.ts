@@ -1,3 +1,4 @@
+import type { BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
@@ -119,29 +120,31 @@ function gitWorktreeConfigDisabled(config: string): boolean {
 }
 
 async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandboxPath[]> {
-  const checkedPaths: { candidate: string; resolved: string; directory: boolean }[] = [];
+  const checkedPaths: { candidate: string; resolved: string; directory: boolean; stat: BigIntStats }[] = [];
   const resolvePath = async (candidate: string, directory: boolean): Promise<string> => {
-    const stat = await fs.lstat(candidate).catch(() => null);
+    const stat = await fs.lstat(candidate, { bigint: true }).catch(() => null);
     const resolved = await fs.realpath(candidate).catch(() => null);
-    if (stat?.isSymbolicLink() || !(directory ? stat?.isDirectory() : stat?.isFile())
+    if (!stat || stat.isSymbolicLink() || !(directory ? stat.isDirectory() : stat.isFile())
       || resolved !== path.resolve(candidate)) {
       throw new Error(`Cannot sandbox Git worktree: "${candidate}" must exist with its expected type and no symlinks.`);
     }
-    checkedPaths.push({ candidate, resolved, directory });
+    checkedPaths.push({ candidate, resolved, directory, stat });
     return resolved;
   };
   const gitFile = path.join(workspaceDir, ".git");
-  if (!(await fs.lstat(gitFile).catch(() => null))?.isFile()) return [];
   let gitDir: string;
   let commonDir: string;
   let worktreesDir: string;
+  let commonFile: string;
+  let backPointer: string;
   try {
     const resolvedGitFile = await resolvePath(gitFile, false);
     const gitdir = /^gitdir: ([^\0\r\n]+)\r?\n?$/.exec(await fs.readFile(resolvedGitFile, "utf8"));
     if (!gitdir || !gitdir[1].trim()) return [];
     const gitDirPath = path.isAbsolute(gitdir[1]) ? gitdir[1] : `${workspaceDir}/${gitdir[1]}`;
     gitDir = await resolvePath(gitDirPath, true);
-    const commonFile = await resolvePath(path.join(gitDir, "commondir"), false);
+    commonFile = await resolvePath(path.join(gitDir, "commondir"), false);
+    backPointer = await resolvePath(path.join(gitDir, "gitdir"), false);
     const commondir = /^([^\0\r\n]+)\r?\n?$/.exec(await fs.readFile(commonFile, "utf8"));
     if (!commondir || !commondir[1].trim()) return [];
     const commonDirPath = path.isAbsolute(commondir[1]) ? commondir[1] : `${gitDir}/${commondir[1]}`;
@@ -166,6 +169,9 @@ async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandb
     { path: gitDir, access: "rw" },
     { path: hooks, access: "ro" },
     { path: config, access: "ro" },
+    { path: gitFile, access: "ro" },
+    { path: commonFile, access: "ro" },
+    { path: backPointer, access: "ro" },
   ];
   for (const [candidate, directory] of [
     [path.join(commonDir, "modules"), true],
@@ -179,15 +185,25 @@ async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandb
     });
     if (exists) mounts.push({ path: await resolvePath(candidate, directory), access: "ro" });
   }
-  // Recheck immediately before args are built, retaining the initially resolved
-  // paths for binds. A race still exists between arg building and bwrap's mount:
-  // path-based --bind/--ro-bind cannot pin an inode against concurrent replacement.
+  // Recheck identity, file size/mtime and pointer targets before args are built,
+  // retaining the initially resolved paths for binds. Races during/after these
+  // checks remain: path-based --bind/--ro-bind cannot pin an inode or its contents
+  // against concurrent changes before bwrap mounts it.
   try {
-    for (const { candidate, resolved, directory } of checkedPaths) {
-      const stat = await fs.lstat(candidate);
+    for (const { candidate, resolved, directory, stat: initial } of checkedPaths) {
+      const stat = await fs.lstat(candidate, { bigint: true });
       if (stat.isSymbolicLink() || !(directory ? stat.isDirectory() : stat.isFile())
+        || stat.dev !== initial.dev || stat.ino !== initial.ino
+        || (!directory && (stat.size !== initial.size || stat.mtimeNs !== initial.mtimeNs))
         || await fs.realpath(candidate) !== resolved) return [];
     }
+    const gitdir = /^gitdir: ([^\0\r\n]+)\r?\n?$/.exec(await fs.readFile(gitFile, "utf8"));
+    const commondir = /^([^\0\r\n]+)\r?\n?$/.exec(await fs.readFile(commonFile, "utf8"));
+    if (!gitdir || !gitdir[1].trim() || !commondir || !commondir[1].trim()) return [];
+    const gitDirPath = path.isAbsolute(gitdir[1]) ? gitdir[1] : `${workspaceDir}/${gitdir[1]}`;
+    const commonDirPath = path.isAbsolute(commondir[1]) ? commondir[1] : `${gitDir}/${commondir[1]}`;
+    if (path.resolve(gitDirPath) !== gitDir || await fs.realpath(gitDirPath) !== gitDir
+      || path.resolve(commonDirPath) !== commonDir || await fs.realpath(commonDirPath) !== commonDir) return [];
   } catch {
     return [];
   }

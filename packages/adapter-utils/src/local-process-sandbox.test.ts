@@ -5,7 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildLocalProcessSandboxSpawnTarget,
   parseLocalProcessFilesystemScope,
@@ -69,6 +69,7 @@ async function withTmpDir<T>(tmpDir: string, run: () => Promise<T>): Promise<T> 
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(cleanup.splice(0).map((candidate) => fs.rm(candidate, { recursive: true, force: true })));
 });
 
@@ -180,6 +181,114 @@ describe("local process sandbox", () => {
     await fs.mkdir(path.join(workspace, ".git"));
     expect((await worktreeSandbox(workspace)).args).toEqual(baseline.args);
   });
+
+  it.runIf(process.platform === "linux").each([".git", "commondir", "gitdir"])(
+    "protects the %s pointer after its covering writable bind",
+    async (entry) => {
+      const { workspace, commonDir, gitDir } = await createGitWorktree();
+      const coveringPath = entry === ".git" ? workspace : gitDir;
+      const pointer = path.join(coveringPath, entry);
+      const { args } = await worktreeSandbox(workspace);
+      expectWorktreeMounts(args, commonDir, gitDir);
+      const coveringBind = args.findIndex((arg, index) =>
+        arg === "--bind" && args[index + 1] === coveringPath && args[index + 2] === coveringPath);
+      const pointerBind = args.lastIndexOf(pointer) - 2;
+      expect(args.slice(coveringBind, coveringBind + 3)).toEqual(["--bind", coveringPath, coveringPath]);
+      expect(args.slice(pointerBind, pointerBind + 3)).toEqual(["--ro-bind", pointer, pointer]);
+      expect(pointerBind).toBeGreaterThan(coveringBind);
+      expect(pointerBind).toBeGreaterThan(args.lastIndexOf(gitDir));
+    },
+  );
+
+  it.runIf(process.platform === "linux").each([
+    [".git", "missing"], [".git", "directory"], [".git", "symlink"],
+    ["commondir", "missing"], ["commondir", "directory"], ["commondir", "symlink"],
+    ["gitdir", "missing"], ["gitdir", "directory"], ["gitdir", "symlink"],
+  ])("adds no worktree mounts for a %s pointer that is %s", async (entry, kind) => {
+    const { workspace, commonDir, gitDir } = await createGitWorktree();
+    const gitFile = path.join(workspace, ".git");
+    const contents = await fs.readFile(gitFile, "utf8");
+    await fs.rm(gitFile);
+    const baseline = await worktreeSandbox(workspace);
+    await fs.writeFile(gitFile, contents);
+    const pointer = path.join(entry === ".git" ? workspace : gitDir, entry);
+    await fs.rename(pointer, `${pointer}-real`);
+    if (kind === "directory") await fs.mkdir(pointer);
+    if (kind === "symlink") await fs.symlink(`${pointer}-real`, pointer);
+    const { args } = await worktreeSandbox(workspace);
+    expect(args).toEqual(baseline.args);
+    expect(args).not.toContain(commonDir);
+    expect(args).not.toContain(gitDir);
+  });
+
+  it.runIf(process.platform === "linux").each([".git", "commondir", "gitdir"])(
+    "adds no mounts when the %s pointer is replaced before the final recheck",
+    async (entry) => {
+      const { workspace, commonDir, gitDir } = await createGitWorktree();
+      const pointer = path.join(entry === ".git" ? workspace : gitDir, entry);
+      const readFile = fs.readFile.bind(fs);
+      let replaced = false;
+      const initial = await fs.lstat(pointer, { bigint: true });
+      // Config is read after discovery has recorded all three pointer identities.
+      vi.spyOn(fs, "readFile").mockImplementation(async (candidate, options) => {
+        const contents = await readFile(candidate, options);
+        if (candidate === path.join(commonDir, "config") && !replaced) {
+          await fs.rename(pointer, `${pointer}-old`);
+          await fs.copyFile(`${pointer}-old`, pointer);
+          replaced = true;
+        }
+        return contents;
+      });
+      const { args } = await worktreeSandbox(workspace);
+      expect(replaced).toBe(true);
+      expect((await fs.lstat(pointer, { bigint: true })).ino).not.toBe(initial.ino);
+      expect(await readFile(pointer)).toEqual(await readFile(`${pointer}-old`));
+      expect(args).not.toContain(commonDir);
+      expect(args).not.toContain(gitDir);
+      expect(args).not.toContain(pointer);
+    },
+  );
+
+  it.runIf(process.platform === "linux").each(["dev", "ino", "size", "mtimeNs"] as const)(
+    "adds no mounts when only file %s differs at the final recheck",
+    async (field) => {
+      const { workspace, commonDir, gitDir } = await createGitWorktree();
+      const config = path.join(commonDir, "config");
+      const lstat = fs.lstat.bind(fs);
+      let checks = 0;
+      vi.spyOn(fs, "lstat").mockImplementation(async (candidate, options) => {
+        const stat = await lstat(candidate, options);
+        if (candidate === config && ++checks === 2 && "mtimeNs" in stat) stat[field] += 1n;
+        return stat;
+      });
+      const { args } = await worktreeSandbox(workspace);
+      expect(checks).toBe(2);
+      expect(args).not.toContain(commonDir);
+      expect(args).not.toContain(gitDir);
+    },
+  );
+
+  it.runIf(process.platform === "linux").each([".git", "commondir"])(
+    "adds no mounts when the %s target changes despite unchanged stat metadata",
+    async (entry) => {
+      const { workspace, commonDir, gitDir } = await createGitWorktree();
+      const pointer = path.join(entry === ".git" ? workspace : gitDir, entry);
+      const readFile = fs.readFile.bind(fs);
+      let reads = 0;
+      vi.spyOn(fs, "readFile").mockImplementation(async (candidate, options) => {
+        const contents = await readFile(candidate, options);
+        // Preserve real stat results to isolate the pointer-content recheck.
+        if (candidate === pointer && ++reads === 2) {
+          return entry === ".git" ? `gitdir: ${commonDir}\n` : `${gitDir}\n`;
+        }
+        return contents;
+      });
+      const { args } = await worktreeSandbox(workspace);
+      expect(reads).toBe(2);
+      expect(args).not.toContain(commonDir);
+      expect(args).not.toContain(gitDir);
+    },
+  );
 
   it.runIf(process.platform === "linux").each([
     ["extensions", "worktreeConfig", "true"],
@@ -421,6 +530,7 @@ describe("local process sandbox", () => {
       const protectedFiles = [
         path.join(commonDir, "hooks", "x"), path.join(commonDir, "config"), path.join(peer, "x"),
         moduleConfig, commonWorktreeConfig, ownWorktreeConfig, attributes,
+        path.join(gitDir, "commondir"), path.join(gitDir, "gitdir"), path.join(workspace, ".git"),
       ];
       const ownFiles = ["HEAD", "index", "logs/HEAD"].map((file) => path.join(gitDir, file));
       const script = [
