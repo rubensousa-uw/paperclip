@@ -1,3 +1,4 @@
+import childProcess from "node:child_process";
 import type { BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import http from "node:http";
@@ -122,7 +123,36 @@ function gitWorktreeConfigSafe(config: string): boolean {
   return true;
 }
 
-async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandboxPath[]> {
+// Internal only: callers cannot request tmpfs mounts through the public path API.
+type GitWorktreeMount = { path: string; access: LocalProcessSandboxAccess | "tmpfs" };
+
+async function gitWorktreeHooksUnset(workspaceDir: string): Promise<boolean> {
+  // Inherit the runtime user's environment, including GIT_CONFIG_{SYSTEM,GLOBAL,
+  // NOSYSTEM,COUNT,...}, just like host Git. Repository-discovery overrides (and
+  // GIT_CONFIG, which replaces config files) could query a different repository
+  // than the pointers we validate, so refuse extra access when any are present.
+  if (["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CONFIG"].some((key) => process.env[key] !== undefined)) {
+    return false;
+  }
+  try {
+    return await new Promise((resolve) => {
+      childProcess.execFile("git", ["config", "--get-all", "core.hooksPath"], {
+        cwd: workspaceDir,
+        env: process.env,
+        timeout: 3_000,
+        killSignal: "SIGKILL",
+      }, (error) => {
+        // Success means configured, even for a bare key or empty value. Only the
+        // documented 'key unset' status grants mounts; timeouts/spawn errors deny.
+        resolve(error?.code === 1 && !error.killed && !error.signal);
+      });
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function gitWorktreePaths(workspaceDir: string): Promise<GitWorktreeMount[]> {
   const checkedPaths: { candidate: string; resolved: string; directory: boolean; stat: BigIntStats }[] = [];
   const resolvePath = async (candidate: string, directory: boolean): Promise<string> => {
     const stat = await fs.lstat(candidate, { bigint: true }).catch(() => null);
@@ -162,6 +192,9 @@ async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandb
   const hooks = await resolvePath(path.join(commonDir, "hooks"), true);
   const config = await resolvePath(path.join(commonDir, "config"), false);
   try {
+    // Retain the strict parser as belt-and-braces: it also rejects includes and
+    // enabled worktreeConfig, whose future files could redirect host Git after
+    // launch. The effective Git query below additionally covers inherited scopes.
     if (!gitWorktreeConfigSafe(await fs.readFile(config, "utf8"))) return [];
   } catch {
     return [];
@@ -171,6 +204,8 @@ async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandb
   // A common dir without objects/ or refs/ is invalid; Git itself refuses it,
   // so treat it as corruption or tampering and fail loudly. logs/ is optional:
   // bare repos may disable core.logAllRefUpdates, so absent logs means no mounts.
+  // Keep that fail-closed rule: bwrap cannot mkdir a missing tmpfs mountpoint
+  // inside the read-only common bind (EROFS), and we do not create it on the host.
   const writablePaths = await Promise.all(["objects", "refs"].map((entry) =>
     resolvePath(path.join(commonDir, entry), true)));
   const logsPath = path.join(commonDir, "logs");
@@ -179,11 +214,26 @@ async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandb
     throw error;
   });
   if (!logsExist) return [];
-  writablePaths.push(await resolvePath(logsPath, true));
-  const mounts: LocalProcessSandboxPath[] = [
+  await resolvePath(logsPath, true);
+  const worktreeLogsPath = path.join(gitDir, "logs");
+  const worktreeLogsExist = await fs.lstat(worktreeLogsPath).then(() => true).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  });
+  if (worktreeLogsExist) await resolvePath(worktreeLogsPath, true);
+  if (!(await gitWorktreeHooksUnset(workspaceDir))) return [];
+  // Mask BOTH reflog roots: host Git follows reflog symlinks on append, even
+  // with core.logAllRefUpdates=false. Agent reflogs must disappear on exit.
+  // Always mask worktree logs, including when absent: otherwise the agent can
+  // plant logs/HEAD in the writable gitDir. In that case bwrap may mkdir an empty
+  // HOST logs directory under the rw bind before covering it with tmpfs. This
+  // harmless directory is preferable to leaving host reflog writes exposed.
+  const mounts: GitWorktreeMount[] = [
     { path: commonDir, access: "ro" },
     ...writablePaths.map((resolved): LocalProcessSandboxPath => ({ path: resolved, access: "rw" })),
+    { path: logsPath, access: "tmpfs" },
     { path: gitDir, access: "rw" },
+    { path: worktreeLogsPath, access: "tmpfs" },
     { path: hooks, access: "ro" },
     { path: config, access: "ro" },
     { path: commonFile, access: "ro" },
@@ -207,6 +257,10 @@ async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandb
   // is accepted under a trusted launch window: bwrap binds by path and cannot
   // pin an inode or its contents. The sandboxed process does not exist yet when
   // these args are built; concurrent runs on the same repo remain an actor.
+  // Declared residual: gitDir/rebase-merge/git-rebase-todo remains writable.
+  // Paperclip runtime only uses rebase|merge|cherry-pick --quit, never resumes.
+  // A human running git rebase --continue in an agent worktree could execute
+  // attacker-chosen exec lines; such manual resumption is outside this boundary.
   try {
     for (const { candidate, resolved, directory, stat: initial } of checkedPaths) {
       const stat = await fs.lstat(candidate, { bigint: true });
@@ -545,9 +599,10 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       created.add(alias);
       mounted.add(alias);
     }
-    const addMount = (source: string, access: LocalProcessSandboxAccess) => {
+    const addMount = (source: string, access: GitWorktreeMount["access"]) => {
       addParentDirectories(args, created, source);
-      args.push(access === "rw" ? "--bind" : "--ro-bind", source, source);
+      if (access === "tmpfs") args.push("--tmpfs", source);
+      else args.push(access === "rw" ? "--bind" : "--ro-bind", source, source);
       mounted.add(source);
       created.add(source);
     };
