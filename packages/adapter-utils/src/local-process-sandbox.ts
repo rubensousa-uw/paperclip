@@ -84,7 +84,7 @@ async function pathExists(candidate: string): Promise<boolean> {
   return fs.lstat(candidate).then(() => true).catch(() => false);
 }
 
-function gitWorktreeConfigDisabled(config: string): boolean {
+function gitWorktreeConfigSafe(config: string): boolean {
   // Only accept the simple INI subset we can inspect without executing Git.
   // Includes, escapes/continuations and malformed syntax leave the setting uncertain.
   if (/[\0\\]|\r(?!\n)/.test(config)) return false;
@@ -102,6 +102,9 @@ function gitWorktreeConfigDisabled(config: string): boolean {
     }
     const entry = /^([a-z][a-z0-9-]*)(?:[ \t]*=[ \t]*(.*))?$/i.exec(line);
     if (!section || !entry) return false;
+    // Even an empty hooksPath can redirect hooks into a writable directory.
+    // Reject every occurrence, rather than interpreting its value or precedence.
+    if (section === "core" && entry[1].toLowerCase() === "hookspath") return false;
     let value = "";
     let quoted = false;
     for (const character of entry[2] ?? "") {
@@ -159,17 +162,30 @@ async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandb
   const hooks = await resolvePath(path.join(commonDir, "hooks"), true);
   const config = await resolvePath(path.join(commonDir, "config"), false);
   try {
-    if (!gitWorktreeConfigDisabled(await fs.readFile(config, "utf8"))) return [];
+    if (!gitWorktreeConfigSafe(await fs.readFile(config, "utf8"))) return [];
   } catch {
     return [];
   }
+  // The common root must stay read-only: newly created metadata (for example
+  // commondir) can redirect host Git. Only allow writes needed for own commits.
+  // A common dir without objects/ or refs/ is invalid; Git itself refuses it,
+  // so treat it as corruption or tampering and fail loudly. logs/ is optional:
+  // bare repos may disable core.logAllRefUpdates, so absent logs means no mounts.
+  const writablePaths = await Promise.all(["objects", "refs"].map((entry) =>
+    resolvePath(path.join(commonDir, entry), true)));
+  const logsPath = path.join(commonDir, "logs");
+  const logsExist = await fs.lstat(logsPath).then(() => true).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  });
+  if (!logsExist) return [];
+  writablePaths.push(await resolvePath(logsPath, true));
   const mounts: LocalProcessSandboxPath[] = [
-    { path: commonDir, access: "rw" },
-    { path: worktreesDir, access: "ro" },
+    { path: commonDir, access: "ro" },
+    ...writablePaths.map((resolved): LocalProcessSandboxPath => ({ path: resolved, access: "rw" })),
     { path: gitDir, access: "rw" },
     { path: hooks, access: "ro" },
     { path: config, access: "ro" },
-    { path: gitFile, access: "ro" },
     { path: commonFile, access: "ro" },
     { path: backPointer, access: "ro" },
   ];
@@ -185,10 +201,12 @@ async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandb
     });
     if (exists) mounts.push({ path: await resolvePath(candidate, directory), access: "ro" });
   }
+  mounts.push({ path: gitFile, access: "ro" });
   // Recheck identity, file size/mtime and pointer targets before args are built,
-  // retaining the initially resolved paths for binds. Races during/after these
-  // checks remain: path-based --bind/--ro-bind cannot pin an inode or its contents
-  // against concurrent changes before bwrap mounts it.
+  // retaining the initially resolved paths for binds. The residual launch race
+  // is accepted under a trusted launch window: bwrap binds by path and cannot
+  // pin an inode or its contents. The sandboxed process does not exist yet when
+  // these args are built; concurrent runs on the same repo remain an actor.
   try {
     for (const { candidate, resolved, directory, stat: initial } of checkedPaths) {
       const stat = await fs.lstat(candidate, { bigint: true });

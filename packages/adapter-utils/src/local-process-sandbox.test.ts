@@ -28,10 +28,10 @@ async function createGitWorktree() {
   const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
   await execFileAsync("git", ["init", "--initial-branch=main", repository], { env });
   await execFileAsync("git", ["-C", repository, "-c", "user.name=Test", "-c", "user.email=test@example.com",
-    "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "Initial"], { env });
+    "commit", "--allow-empty", "-m", "Initial"], { env });
   await execFileAsync("git", ["-C", repository, "worktree", "add", "-b", "own", workspace], { env });
   await fs.mkdir(path.join(commonDir, "hooks"), { recursive: true });
-  return { workspace, commonDir, gitDir };
+  return { repository, workspace, commonDir, gitDir };
 }
 
 function worktreeSandbox(workspace: string) {
@@ -43,18 +43,30 @@ function worktreeSandbox(workspace: string) {
   });
 }
 
-function expectWorktreeMounts(args: string[], commonDir: string, gitDir: string) {
-  const worktreesDir = path.join(commonDir, "worktrees");
-  const hooks = path.join(commonDir, "hooks");
-  const config = path.join(commonDir, "config");
-  const start = args.lastIndexOf(commonDir) - 2;
-  expect(args.slice(start, start + 15)).toEqual([
-    "--bind", commonDir, commonDir,
-    "--ro-bind", worktreesDir, worktreesDir,
-    "--bind", gitDir, gitDir,
-    "--ro-bind", hooks, hooks,
-    "--ro-bind", config, config,
+function expectWorktreeMounts(
+  args: string[], workspace: string, commonDir: string, gitDir: string,
+  optionalReadOnlyPaths = [path.join(commonDir, "info")],
+) {
+  const mounts = args.flatMap((arg, index) =>
+    arg === "--bind" || arg === "--ro-bind" ? [args.slice(index, index + 3)] : []);
+  const start = mounts.findLastIndex((mount) => mount[1] === commonDir);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(mounts.slice(start)).toEqual([
+    ["--ro-bind", commonDir, commonDir],
+    ...["objects", "refs", "logs"].map((entry) => {
+      const candidate = path.join(commonDir, entry);
+      return ["--bind", candidate, candidate];
+    }),
+    ["--bind", gitDir, gitDir],
+    ...[
+      path.join(commonDir, "hooks"), path.join(commonDir, "config"),
+      path.join(gitDir, "commondir"), path.join(gitDir, "gitdir"),
+      ...optionalReadOnlyPaths, path.join(workspace, ".git"),
+    ].map((candidate) => ["--ro-bind", candidate, candidate]),
   ]);
+  const workspaceBind = mounts.findIndex((mount) => mount[0] === "--bind" && mount[1] === workspace);
+  expect(workspaceBind).toBeGreaterThanOrEqual(0);
+  expect(start).toBeGreaterThan(workspaceBind);
 }
 
 async function withTmpDir<T>(tmpDir: string, run: () => Promise<T>): Promise<T> {
@@ -169,10 +181,24 @@ describe("local process sandbox", () => {
         await fs.writeFile(path.join(gitDir, "commondir"), `${commonDir}\n`);
       }
       const target = await worktreeSandbox(workspace);
-      expectWorktreeMounts(target.args, commonDir, gitDir);
+      expectWorktreeMounts(target.args, workspace, commonDir, gitDir);
       expect(target.args.indexOf(workspace)).toBeLessThan(target.args.indexOf(commonDir));
     },
   );
+
+  it.runIf(process.platform === "linux")("orders the complete allowlist before every read-only overlay", async () => {
+    const { workspace, commonDir, gitDir } = await createGitWorktree();
+    const modules = path.join(commonDir, "modules");
+    const commonConfig = path.join(commonDir, "config.worktree");
+    const ownConfig = path.join(gitDir, "config.worktree");
+    await fs.mkdir(modules);
+    await fs.writeFile(commonConfig, "# existing config\n");
+    await fs.writeFile(ownConfig, "# existing config\n");
+    const { args } = await worktreeSandbox(workspace);
+    expectWorktreeMounts(args, workspace, commonDir, gitDir, [
+      modules, commonConfig, ownConfig, path.join(commonDir, "info"),
+    ]);
+  });
 
   it.runIf(process.platform === "linux")("preserves identical args for a normal checkout or no .git", async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-directory-"));
@@ -189,7 +215,7 @@ describe("local process sandbox", () => {
       const coveringPath = entry === ".git" ? workspace : gitDir;
       const pointer = path.join(coveringPath, entry);
       const { args } = await worktreeSandbox(workspace);
-      expectWorktreeMounts(args, commonDir, gitDir);
+      expectWorktreeMounts(args, workspace, commonDir, gitDir);
       const coveringBind = args.findIndex((arg, index) =>
         arg === "--bind" && args[index + 1] === coveringPath && args[index + 2] === coveringPath);
       const pointerBind = args.lastIndexOf(pointer) - 2;
@@ -312,9 +338,48 @@ describe("local process sandbox", () => {
     async (value) => {
       const { workspace, commonDir, gitDir } = await createGitWorktree();
       await fs.appendFile(path.join(commonDir, "config"), `\n[ExTeNsIoNs] ; comment\n\tWorktreeConfig = ${value} # comment\n`);
-      expectWorktreeMounts((await worktreeSandbox(workspace)).args, commonDir, gitDir);
+      expectWorktreeMounts((await worktreeSandbox(workspace)).args, workspace, commonDir, gitDir);
     },
   );
+
+  it.runIf(process.platform === "linux").each([
+    "[core]\nhooksPath = x\n",
+    "[core]\nhookspath=\n",
+    "[CORE]\nHOOKSPATH\n",
+    '[CoRe]\nHoOkSpAtH = "../hooks with spaces" # comment\n',
+    '[core]\nhooksPath = ""\n',
+    "[core] hooksPath = x\n",
+    "[core]\nhooksPath = x\n[core]\nhooksPath =\n",
+  ])("adds no mounts for configured core.hooksPath: %j", async (config) => {
+    const { workspace, commonDir, gitDir } = await createGitWorktree();
+    const gitFile = path.join(workspace, ".git");
+    await fs.rm(gitFile);
+    const baseline = await worktreeSandbox(workspace);
+    await fs.writeFile(gitFile, `gitdir: ${gitDir}\n`);
+    const configPath = path.join(commonDir, "config");
+    await fs.appendFile(configPath, `\n${config}`);
+    // These are real Git spellings, including inline sections and bare/empty keys.
+    const parsed = await execFileAsync("git", ["config", "--file", configPath, "--get-all", "core.hooksPath"]);
+    expect(parsed.stdout).toContain("\n");
+    expect((await worktreeSandbox(workspace)).args).toEqual(baseline.args);
+  });
+
+  it.runIf(process.platform === "linux").each([
+    '[core]\nhooksPath = "unterminated\n',
+    "[core\nhooksPath = x\n",
+    "[core]\nhooksPath = hook\\\ns\n",
+    '[core]\nhooksPath = "bad\\qescape"\n',
+    "[core]\nhooksPath = x\0\n",
+    '[includeIf "gitdir:*"]\npath = hooks-config\n',
+    "[core]\nhooksPath ? x\n",
+  ])("adds no mounts for uncertain hooksPath config: %j", async (config) => {
+    const { workspace, commonDir, gitDir } = await createGitWorktree();
+    await fs.rm(path.join(workspace, ".git"));
+    const baseline = await worktreeSandbox(workspace);
+    await fs.writeFile(path.join(workspace, ".git"), `gitdir: ${gitDir}\n`);
+    await fs.appendFile(path.join(commonDir, "config"), `\n${config}`);
+    expect((await worktreeSandbox(workspace)).args).toEqual(baseline.args);
+  });
 
   it.runIf(process.platform === "linux").each([
     "[extensions]\nworktreeConfig = maybe\n",
@@ -340,7 +405,7 @@ describe("local process sandbox", () => {
     ["config.worktree", false, "common"],
     ["config.worktree", false, "own"],
     ["info", true, "common"],
-  ] as const)("protects %s (%s, %s) after its covering writable bind", async (entry, directory, location) => {
+  ] as const)("protects %s (%s, %s) after its covering bind", async (entry, directory, location) => {
     const { workspace, commonDir, gitDir } = await createGitWorktree();
     const coveringPath = location === "common" ? commonDir : gitDir;
     const protectedPath = path.join(coveringPath, entry);
@@ -349,7 +414,9 @@ describe("local process sandbox", () => {
     const { args } = await worktreeSandbox(workspace);
     const coveringBind = args.lastIndexOf(coveringPath) - 2;
     const protectedBind = args.lastIndexOf(protectedPath) - 2;
-    expect(args.slice(coveringBind, coveringBind + 3)).toEqual(["--bind", coveringPath, coveringPath]);
+    expect(args.slice(coveringBind, coveringBind + 3)).toEqual([
+      location === "common" ? "--ro-bind" : "--bind", coveringPath, coveringPath,
+    ]);
     expect(args.slice(protectedBind, protectedBind + 3)).toEqual(["--ro-bind", protectedPath, protectedPath]);
     expect(protectedBind).toBeGreaterThan(coveringBind);
     expect(protectedBind).toBeGreaterThan(args.lastIndexOf(gitDir));
@@ -359,7 +426,7 @@ describe("local process sandbox", () => {
     const { workspace, commonDir, gitDir } = await createGitWorktree();
     await fs.rm(path.join(commonDir, "info"), { recursive: true });
     const { args } = await worktreeSandbox(workspace);
-    expectWorktreeMounts(args, commonDir, gitDir);
+    expectWorktreeMounts(args, workspace, commonDir, gitDir, []);
     for (const candidate of [
       path.join(commonDir, "modules"), path.join(commonDir, "info"),
       path.join(commonDir, "config.worktree"), path.join(gitDir, "config.worktree"),
@@ -395,12 +462,13 @@ describe("local process sandbox", () => {
     await fs.writeFile(path.join(workspace, ".git"), `gitdir: ${gitDirPointer}\n`);
     await fs.writeFile(path.join(gitDir, "commondir"), `${commonPointer}\n`);
     const { args } = await worktreeSandbox(workspace);
-    expectWorktreeMounts(args, await fs.realpath(commonDir), await fs.realpath(gitDir));
+    expectWorktreeMounts(args, workspace, await fs.realpath(commonDir), await fs.realpath(gitDir));
     expect(args).not.toContain(gitDirPointer);
     expect(args).not.toContain(commonPointer);
     const start = args.lastIndexOf(commonDir) - 2;
-    const end = args.lastIndexOf(path.join(commonDir, "info"));
-    for (let index = start; index < end; index += 3) {
+    const end = args.lastIndexOf(path.join(workspace, ".git"));
+    for (let index = start; index < end; index++) {
+      if (args[index] !== "--bind" && args[index] !== "--ro-bind") continue;
       expect(args[index + 1]).toBe(await fs.realpath(args[index + 1]));
       expect(args[index + 2]).toBe(args[index + 1]);
     }
@@ -420,12 +488,13 @@ describe("local process sandbox", () => {
     },
   );
 
-  it.runIf(process.platform === "linux").each(["hooks", "config"])(
+  it.runIf(process.platform === "linux").each(["hooks", "config", "objects", "refs"])(
     "rejects missing %s before mounting writable common metadata",
     async (entry) => {
       const { workspace, commonDir } = await createGitWorktree();
       await fs.rm(path.join(commonDir, entry), { recursive: true });
       await expect(worktreeSandbox(workspace)).rejects.toThrow(`"${path.join(commonDir, entry)}" must exist`);
+      await expect(fs.lstat(path.join(commonDir, entry))).rejects.toMatchObject({ code: "ENOENT" });
     },
   );
 
@@ -481,7 +550,35 @@ describe("local process sandbox", () => {
     expect((await worktreeSandbox(workspace)).args).toEqual(baseline.args);
   });
 
-  it.runIf(process.platform === "linux").each(["hooks", "config"])(
+  it.runIf(process.platform === "linux")("adds no worktree mounts for a bare repository without logs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-bare-git-worktree-"));
+    cleanup.push(root);
+    const repository = path.join(root, "repository");
+    const bare = path.join(root, "b.git");
+    const workspace = path.join(root, "workspace");
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+    await execFileAsync("git", ["init", "--initial-branch=main", repository], { env });
+    await execFileAsync("git", ["-C", repository, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+      "commit", "--allow-empty", "-m", "Initial"], { env });
+    await execFileAsync("git", ["init", "--bare", "--initial-branch=main", bare], { env });
+    await execFileAsync("git", ["-C", repository, "push", bare, "main"], { env });
+    await execFileAsync("git", ["-C", bare, "worktree", "add", workspace, "main"], { env });
+
+    const logsPath = path.join(bare, "logs");
+    await expect(fs.lstat(logsPath)).rejects.toMatchObject({ code: "ENOENT" });
+    const gitFile = path.join(workspace, ".git");
+    const gitFileContents = await fs.readFile(gitFile, "utf8");
+    await fs.rm(gitFile);
+    const baseline = await worktreeSandbox(workspace);
+    await fs.writeFile(gitFile, gitFileContents);
+
+    const target = await worktreeSandbox(workspace);
+    expect(target.args).toEqual(baseline.args);
+    expect(target.args).not.toContain(bare);
+    await expect(fs.lstat(logsPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.runIf(process.platform === "linux").each(["hooks", "config", "objects", "refs", "logs"])(
     "rejects symlinked %s before mounting writable common metadata",
     async (entry) => {
       const { workspace, commonDir } = await createGitWorktree();
@@ -491,6 +588,16 @@ describe("local process sandbox", () => {
       await expect(worktreeSandbox(workspace)).rejects.toThrow(`"${protectedPath}" must exist`);
     },
   );
+
+  it.runIf(process.platform === "linux")("rejects logs when it is not a directory", async () => {
+    const { workspace, commonDir } = await createGitWorktree();
+    const logsPath = path.join(commonDir, "logs");
+    await fs.rm(logsPath, { recursive: true });
+    await fs.writeFile(logsPath, "not a directory");
+    await expect(worktreeSandbox(workspace)).rejects.toThrow(
+      `"${logsPath}" must exist with its expected type and no symlinks.`,
+    );
+  });
 
   it.runIf(process.platform === "linux")("reapplies ordered worktree mounts after overlapping managed paths", async () => {
     const { workspace, commonDir, gitDir } = await createGitWorktree();
@@ -508,13 +615,13 @@ describe("local process sandbox", () => {
         ],
       },
     });
-    expectWorktreeMounts(target.args, commonDir, gitDir);
+    expectWorktreeMounts(target.args, workspace, commonDir, gitDir);
   });
 
   it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(
     "rejects protected Git metadata writes with EROFS while allowing own metadata writes and commits",
     async () => {
-      const { workspace, commonDir, gitDir } = await createGitWorktree();
+      const { repository, workspace, commonDir, gitDir } = await createGitWorktree();
       const peer = path.join(commonDir, "worktrees", "peer");
       await fs.mkdir(peer);
       const moduleConfig = path.join(commonDir, "modules", "x", "config");
@@ -525,10 +632,18 @@ describe("local process sandbox", () => {
       for (const file of [moduleConfig, commonWorktreeConfig, ownWorktreeConfig, attributes]) {
         await fs.writeFile(file, "# existing metadata\n");
       }
+      // Keep hooks enabled and prove a real hook runs through the read-only hooks mount.
+      await fs.writeFile(path.join(commonDir, "hooks", "pre-commit"), "#!/bin/sh\nprintf hook-ran > hook-ran.txt\n", { mode: 0o755 });
       const target = await worktreeSandbox(workspace);
-      expectWorktreeMounts(target.args, commonDir, gitDir);
+      expectWorktreeMounts(target.args, workspace, commonDir, gitDir, [
+        path.join(commonDir, "modules"), commonWorktreeConfig, ownWorktreeConfig, path.join(commonDir, "info"),
+      ]);
+      // Config must exist for strict parsing and its explicit ro-bind. Removing
+      // it before launch would reject setup, so exercise overwrite here; absent
+      // config is covered by the fail-closed setup test above.
       const protectedFiles = [
         path.join(commonDir, "hooks", "x"), path.join(commonDir, "config"), path.join(peer, "x"),
+        path.join(commonDir, "commondir"), path.join(commonDir, "evil"), path.join(commonDir, "packed-refs"),
         moduleConfig, commonWorktreeConfig, ownWorktreeConfig, attributes,
         path.join(gitDir, "commondir"), path.join(gitDir, "gitdir"), path.join(workspace, ".git"),
       ];
@@ -543,13 +658,13 @@ describe("local process sandbox", () => {
         "}",
         `for (const file of ${JSON.stringify(ownFiles)}) fs.writeFileSync(file, fs.readFileSync(file));`,
         `fs.writeFileSync(${JSON.stringify(path.join(gitDir, "own-ok"))}, 'ok');`,
-        `fs.writeFileSync(${JSON.stringify(path.join(commonDir, "common-ok"))}, 'ok');`,
         "fs.writeFileSync('committed.txt', 'sandbox commit\\n');",
         "const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };",
         "execFileSync('git', ['add', 'committed.txt'], { env });",
         "execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com',",
-        "  '-c', 'core.hooksPath=/dev/null', 'commit', '--no-gpg-sign', '-m', 'Sandbox commit'], { env });",
+        "  'commit', '--no-gpg-sign', '-m', 'Sandbox commit'], { env });",
         "if (execFileSync('git', ['branch', '--show-current'], { env, encoding: 'utf8' }).trim() !== 'own') process.exit(10);",
+        "fs.writeFileSync('sandbox-commit-sha', execFileSync('git', ['rev-parse', 'HEAD'], { env }));",
       ].join("\n");
       const result = await runChildProcess("git-worktree-sandbox-test", process.execPath, ["-e", script], {
         cwd: workspace,
@@ -565,10 +680,17 @@ describe("local process sandbox", () => {
       });
       expect(result.exitCode, result.stderr).toBe(0);
       await expect(fs.readFile(path.join(gitDir, "own-ok"), "utf8")).resolves.toBe("ok");
-      const commit = await execFileAsync("git", ["-C", workspace, "log", "-1", "--format=%s"], {
+      await expect(fs.readFile(path.join(workspace, "hook-ran.txt"), "utf8")).resolves.toBe("hook-ran");
+      for (const entry of ["commondir", "evil", "packed-refs"]) {
+        await expect(fs.lstat(path.join(commonDir, entry))).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      const sandboxSha = (await fs.readFile(path.join(workspace, "sandbox-commit-sha"), "utf8")).trim();
+      expect(sandboxSha).toMatch(/^[0-9a-f]{40}$/);
+      // Resolve the shared branch from the HOST main checkout after sandbox exit.
+      const commit = await execFileAsync("git", ["-C", repository, "log", "-1", "--format=%H%n%s", "own"], {
         env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
       });
-      expect(commit.stdout.trim()).toBe("Sandbox commit");
+      expect(commit.stdout.trim()).toBe(`${sandboxSha}\nSandbox commit`);
     },
   );
 
