@@ -1,11 +1,12 @@
-import { execFile } from "node:child_process";
+import childProcess, { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildLocalProcessSandboxSpawnTarget,
   parseLocalProcessFilesystemScope,
@@ -48,16 +49,19 @@ function expectWorktreeMounts(
   optionalReadOnlyPaths = [path.join(commonDir, "info")],
 ) {
   const mounts = args.flatMap((arg, index) =>
-    arg === "--bind" || arg === "--ro-bind" ? [args.slice(index, index + 3)] : []);
+    arg === "--bind" || arg === "--ro-bind" ? [args.slice(index, index + 3)]
+      : arg === "--tmpfs" ? [args.slice(index, index + 2)] : []);
   const start = mounts.findLastIndex((mount) => mount[1] === commonDir);
   expect(start).toBeGreaterThanOrEqual(0);
   expect(mounts.slice(start)).toEqual([
     ["--ro-bind", commonDir, commonDir],
-    ...["objects", "refs", "logs"].map((entry) => {
+    ...["objects", "refs"].map((entry) => {
       const candidate = path.join(commonDir, entry);
       return ["--bind", candidate, candidate];
     }),
+    ["--tmpfs", path.join(commonDir, "logs")],
     ["--bind", gitDir, gitDir],
+    ["--tmpfs", path.join(gitDir, "logs")],
     ...[
       path.join(commonDir, "hooks"), path.join(commonDir, "config"),
       path.join(gitDir, "commondir"), path.join(gitDir, "gitdir"),
@@ -67,6 +71,24 @@ function expectWorktreeMounts(
   const workspaceBind = mounts.findIndex((mount) => mount[0] === "--bind" && mount[1] === workspace);
   expect(workspaceBind).toBeGreaterThanOrEqual(0);
   expect(start).toBeGreaterThan(workspaceBind);
+  expect(mounts).not.toContainEqual(["--bind", path.join(commonDir, "logs"), path.join(commonDir, "logs")]);
+}
+
+async function hashTree(root: string): Promise<string> {
+  const hash = createHash("sha256");
+  const visit = async (relative: string): Promise<void> => {
+    const candidate = path.join(root, relative);
+    const stat = await fs.lstat(candidate);
+    const type = stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "directory" : "file";
+    const bytes = type === "symlink" ? Buffer.from(await fs.readlink(candidate))
+      : type === "file" ? await fs.readFile(candidate) : Buffer.alloc(0);
+    hash.update(JSON.stringify([relative, type, bytes.toString("base64")]));
+    if (type === "directory") {
+      for (const entry of (await fs.readdir(candidate)).sort()) await visit(path.join(relative, entry));
+    }
+  };
+  await visit("");
+  return hash.digest("hex");
 }
 
 async function withTmpDir<T>(tmpDir: string, run: () => Promise<T>): Promise<T> {
@@ -80,8 +102,15 @@ async function withTmpDir<T>(tmpDir: string, run: () => Promise<T>): Promise<T> 
   }
 }
 
+beforeEach(() => {
+  // Real Git probes must not depend on the developer's system/global hooks.
+  vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+  vi.stubEnv("GIT_CONFIG_GLOBAL", "/dev/null");
+});
+
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   await Promise.all(cleanup.splice(0).map((candidate) => fs.rm(candidate, { recursive: true, force: true })));
 });
 
@@ -199,6 +228,36 @@ describe("local process sandbox", () => {
       modules, commonConfig, ownConfig, path.join(commonDir, "info"),
     ]);
   });
+
+  it.runIf(process.platform === "linux").each([
+    [true, true], [true, false], [false, true], [false, false],
+  ])("handles common logs present=%s and worktree logs present=%s", async (commonPresent, ownPresent) => {
+    const { workspace, commonDir, gitDir } = await createGitWorktree();
+    const commonLogs = path.join(commonDir, "logs");
+    const ownLogs = path.join(gitDir, "logs");
+    if (!commonPresent) await fs.rm(commonLogs, { recursive: true });
+    if (!ownPresent) await fs.rm(ownLogs, { recursive: true });
+    const { args } = await worktreeSandbox(workspace);
+    if (commonPresent) expectWorktreeMounts(args, workspace, commonDir, gitDir);
+    else {
+      expect(args).not.toContain(commonDir);
+      expect(args).not.toContain(gitDir);
+    }
+    // Argument construction does not create mountpoints on the host.
+    if (!commonPresent) await expect(fs.lstat(commonLogs)).rejects.toMatchObject({ code: "ENOENT" });
+    if (!ownPresent) await expect(fs.lstat(ownLogs)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.runIf(process.platform === "linux").each(["symlink", "file"])(
+    "rejects a worktree logs mountpoint that is a %s", async (kind) => {
+      const { workspace, gitDir } = await createGitWorktree();
+      const logs = path.join(gitDir, "logs");
+      await fs.rename(logs, `${logs}-real`);
+      if (kind === "symlink") await fs.symlink(`${logs}-real`, logs);
+      else await fs.writeFile(logs, "not a directory");
+      await expect(worktreeSandbox(workspace)).rejects.toThrow(`"${logs}" must exist`);
+    },
+  );
 
   it.runIf(process.platform === "linux")("preserves identical args for a normal checkout or no .git", async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-directory-"));
@@ -363,6 +422,99 @@ describe("local process sandbox", () => {
     expect(parsed.stdout).toContain("\n");
     expect((await worktreeSandbox(workspace)).args).toEqual(baseline.args);
   });
+
+  it.runIf(process.platform === "linux").each(["system", "global"])(
+    "uses real Git to deny effective %s hooksPath, including empty values", async (scope) => {
+      const { workspace, commonDir, gitDir } = await createGitWorktree();
+      const config = path.join(path.dirname(workspace), `${scope}.gitconfig`);
+      vi.stubEnv(scope === "global" ? "GIT_CONFIG_GLOBAL" : "GIT_CONFIG_SYSTEM", config);
+      if (scope === "system") vi.stubEnv("GIT_CONFIG_NOSYSTEM", "0");
+      for (const value of ["agent-hooks", ""]) {
+        await fs.writeFile(config, `[core]\n\thooksPath = ${value}\n`);
+        const parsed = await execFileAsync("git", ["config", "--get-all", "core.hooksPath"], { cwd: workspace });
+        expect(parsed.stdout).toBe(`${value}\n`);
+        const { args } = await worktreeSandbox(workspace);
+        expect(args).not.toContain(commonDir);
+        expect(args).not.toContain(gitDir);
+      }
+      await fs.writeFile(config, "# key unset\n");
+      expectWorktreeMounts((await worktreeSandbox(workspace)).args, workspace, commonDir, gitDir);
+    },
+  );
+
+  it.runIf(process.platform === "linux")("denies real worktree-level hooksPath", async () => {
+    const { workspace, commonDir, gitDir } = await createGitWorktree();
+    await execFileAsync("git", ["config", "extensions.worktreeConfig", "true"], { cwd: workspace });
+    await execFileAsync("git", ["config", "--worktree", "core.hooksPath", "agent-hooks"], { cwd: workspace });
+    const parsed = await execFileAsync("git", ["config", "--get-all", "core.hooksPath"], { cwd: workspace });
+    expect(parsed.stdout).toBe("agent-hooks\n");
+    const { args } = await worktreeSandbox(workspace);
+    expect(args).not.toContain(commonDir);
+    expect(args).not.toContain(gitDir);
+  });
+
+  it.runIf(process.platform === "linux")("includes command-scope config from the runtime environment", async () => {
+    const { workspace, commonDir } = await createGitWorktree();
+    vi.stubEnv("GIT_CONFIG_COUNT", "1");
+    vi.stubEnv("GIT_CONFIG_KEY_0", "core.hooksPath");
+    vi.stubEnv("GIT_CONFIG_VALUE_0", "agent-hooks");
+    expect((await worktreeSandbox(workspace)).args).not.toContain(commonDir);
+  });
+
+  it.runIf(process.platform === "linux").each(["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CONFIG"])(
+    "denies mounts when %s could redirect the effective config query", async (key) => {
+      const { workspace, commonDir, gitDir } = await createGitWorktree();
+      vi.stubEnv(key, commonDir);
+      const { args } = await worktreeSandbox(workspace);
+      expect(args).not.toContain(commonDir);
+      expect(args).not.toContain(gitDir);
+    },
+  );
+
+  it.runIf(process.platform === "linux").each([
+    ["empty successful output", null],
+    ["exit 128", { code: 128 }],
+    ["exit 2", { code: 2 }],
+    ["spawn failure", { code: "ENOENT" }],
+    ["timeout", { code: 1, killed: true, signal: "SIGKILL" }],
+  ] as const)("denies mounts for an injected Git result: %s", async (_label, failure) => {
+    const { workspace, commonDir, gitDir } = await createGitWorktree();
+    // Mock the native subprocess boundary, without adding a caller-facing bypass.
+    const probe = vi.spyOn(childProcess, "execFile").mockImplementationOnce((_file, _args, _options, callback) => {
+      callback!(failure === null ? null : Object.assign(new Error("git failed"), failure), "", "");
+      return {} as childProcess.ChildProcess;
+    });
+    const { args } = await worktreeSandbox(workspace);
+    expect(probe).toHaveBeenCalledWith("git", ["config", "--get-all", "core.hooksPath"], {
+      cwd: workspace, env: process.env, timeout: 3_000, killSignal: "SIGKILL",
+    }, expect.any(Function));
+    expect(args).not.toContain(commonDir);
+    expect(args).not.toContain(gitDir);
+  });
+
+  it.runIf(process.platform === "linux")("denies mounts if spawning Git throws", async () => {
+    const { workspace, commonDir } = await createGitWorktree();
+    vi.spyOn(childProcess, "execFile").mockImplementationOnce(() => { throw new Error("spawn failed"); });
+    expect((await worktreeSandbox(workspace)).args).not.toContain(commonDir);
+  });
+
+  it.runIf(process.platform === "linux")("kills a stalled config probe without blocking the event loop", async () => {
+    const { workspace, commonDir, gitDir } = await createGitWorktree();
+    const bin = path.join(path.dirname(workspace), "bin");
+    await fs.mkdir(bin);
+    await fs.writeFile(path.join(bin, "git"), "#!/bin/sh\nexec /bin/sleep 30\n", { mode: 0o755 });
+    vi.stubEnv("PATH", bin);
+    const probe = vi.spyOn(childProcess, "execFile");
+    let settled = false;
+    const pending = worktreeSandbox(workspace).finally(() => { settled = true; });
+    // This timer can fire while execFile waits; SIGKILL bounds the actual child.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(settled).toBe(false);
+    const { args } = await pending;
+    expect(probe.mock.results[0].value.signalCode).toBe("SIGKILL");
+    expect(args).not.toContain(commonDir);
+    expect(args).not.toContain(gitDir);
+  }, 10_000);
 
   it.runIf(process.platform === "linux").each([
     '[core]\nhooksPath = "unterminated\n',
@@ -647,7 +799,7 @@ describe("local process sandbox", () => {
         moduleConfig, commonWorktreeConfig, ownWorktreeConfig, attributes,
         path.join(gitDir, "commondir"), path.join(gitDir, "gitdir"), path.join(workspace, ".git"),
       ];
-      const ownFiles = ["HEAD", "index", "logs/HEAD"].map((file) => path.join(gitDir, file));
+      const ownFiles = ["HEAD", "index"].map((file) => path.join(gitDir, file));
       const script = [
         "const fs = require('node:fs');",
         "const { execFileSync } = require('node:child_process');",
@@ -657,6 +809,8 @@ describe("local process sandbox", () => {
         "  }",
         "}",
         `for (const file of ${JSON.stringify(ownFiles)}) fs.writeFileSync(file, fs.readFileSync(file));`,
+        // The per-worktree reflog starts empty in its private tmpfs.
+        `fs.writeFileSync(${JSON.stringify(path.join(gitDir, "logs", "HEAD"))}, '');`,
         `fs.writeFileSync(${JSON.stringify(path.join(gitDir, "own-ok"))}, 'ok');`,
         "fs.writeFileSync('committed.txt', 'sandbox commit\\n');",
         "const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };",
@@ -691,6 +845,51 @@ describe("local process sandbox", () => {
         env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
       });
       expect(commit.stdout.trim()).toBe(`${sandboxSha}\nSandbox commit`);
+    },
+  );
+
+  it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(
+    "discards sandbox reflog writes and symlink planting without changing host logs",
+    async () => {
+      const { repository, workspace, commonDir, gitDir } = await createGitWorktree();
+      const logs = [path.join(commonDir, "logs"), path.join(gitDir, "logs")];
+      const planted = [path.join(logs[0], "refs", "heads", "own"), path.join(logs[1], "HEAD")];
+      const before = await Promise.all(logs.map(hashTree));
+      const hostFile = path.join(path.dirname(workspace), "host-shell-rc");
+      await fs.writeFile(hostFile, "host bytes must survive\n");
+      const script = [
+        "const fs = require('node:fs');",
+        "const { execFileSync } = require('node:child_process');",
+        "fs.writeFileSync('committed.txt', 'sandbox commit\\n');",
+        "const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };",
+        "execFileSync('git', ['add', 'committed.txt'], { env });",
+        "execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com',",
+        "  'commit', '--no-gpg-sign', '-m', 'Isolated reflogs'], { env });",
+        `for (const file of ${JSON.stringify(planted)}) {`,
+        // Require real writes in BOTH tmpfs roots before replacing the files.
+        "  if (!fs.readFileSync(file, 'utf8').includes('Isolated reflogs')) process.exit(11);",
+        `  execFileSync('ln', ['-sf', ${JSON.stringify(hostFile)}, file]);`,
+        `  if (fs.readlinkSync(file) !== ${JSON.stringify(hostFile)}) process.exit(12);`,
+        "}",
+      ].join("\n");
+      const result = await runChildProcess("git-reflog-isolation-test", process.execPath, ["-e", script], {
+        cwd: workspace,
+        env: {},
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+        localProcessSandbox: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          command: process.env.PAPERCLIP_TEST_BWRAP,
+        },
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(await Promise.all(logs.map(hashTree))).toEqual(before);
+      for (const file of planted) expect((await fs.lstat(file)).isSymbolicLink()).toBe(false);
+      expect(await fs.readFile(hostFile, "utf8")).toBe("host bytes must survive\n");
+      const commit = await execFileAsync("git", ["-C", repository, "log", "-1", "--format=%s", "own"]);
+      expect(commit.stdout.trim()).toBe("Isolated reflogs");
     },
   );
 
