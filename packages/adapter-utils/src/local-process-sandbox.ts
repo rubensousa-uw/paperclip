@@ -83,51 +83,115 @@ async function pathExists(candidate: string): Promise<boolean> {
   return fs.lstat(candidate).then(() => true).catch(() => false);
 }
 
+function gitWorktreeConfigDisabled(config: string): boolean {
+  // Only accept the simple INI subset we can inspect without executing Git.
+  // Includes, escapes/continuations and malformed syntax leave the setting uncertain.
+  if (/[\0\\]|\r(?!\n)/.test(config)) return false;
+  let section = "";
+  for (const rawLine of config.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || /^[#;]/.test(line)) continue;
+    if (line.startsWith("[")) {
+      const header = /^\[([a-z0-9-]+)(?:[ \t]+("[^"\\]*"))?\][ \t]*(?:[#;].*)?$/i.exec(line);
+      if (!header) return false;
+      const name = header[1].toLowerCase();
+      if (name === "include" || name === "includeif") return false;
+      section = header[2] === undefined ? name : "subsection";
+      continue;
+    }
+    const entry = /^([a-z][a-z0-9-]*)(?:[ \t]*=[ \t]*(.*))?$/i.exec(line);
+    if (!section || !entry) return false;
+    let value = "";
+    let quoted = false;
+    for (const character of entry[2] ?? "") {
+      if (character === '"') quoted = !quoted;
+      if (!quoted && (character === "#" || character === ";")) break;
+      value += character;
+    }
+    if (quoted) return false;
+    if (section === "extensions" && entry[1].toLowerCase() === "worktreeconfig") {
+      // A bare key is true. Deny any enabled or unknown value, even if repeated.
+      const booleanValue = value.trim().replace(/^"([^"]*)"$/, "$1").toLowerCase();
+      if (entry[2] === undefined || !["false", "no", "off", "0", ""].includes(booleanValue)) return false;
+    }
+  }
+  return true;
+}
+
 async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandboxPath[]> {
+  const checkedPaths: { candidate: string; resolved: string; directory: boolean }[] = [];
+  const resolvePath = async (candidate: string, directory: boolean): Promise<string> => {
+    const stat = await fs.lstat(candidate).catch(() => null);
+    const resolved = await fs.realpath(candidate).catch(() => null);
+    if (stat?.isSymbolicLink() || !(directory ? stat?.isDirectory() : stat?.isFile())
+      || resolved !== path.resolve(candidate)) {
+      throw new Error(`Cannot sandbox Git worktree: "${candidate}" must exist with its expected type and no symlinks.`);
+    }
+    checkedPaths.push({ candidate, resolved, directory });
+    return resolved;
+  };
   const gitFile = path.join(workspaceDir, ".git");
   if (!(await fs.lstat(gitFile).catch(() => null))?.isFile()) return [];
   let gitDir: string;
   let commonDir: string;
+  let worktreesDir: string;
   try {
-    if (await fs.realpath(gitFile) !== gitFile) return [];
-    const gitdir = /^gitdir: ([^\0\r\n]+)\r?\n?$/.exec(await fs.readFile(gitFile, "utf8"));
+    const resolvedGitFile = await resolvePath(gitFile, false);
+    const gitdir = /^gitdir: ([^\0\r\n]+)\r?\n?$/.exec(await fs.readFile(resolvedGitFile, "utf8"));
     if (!gitdir || !gitdir[1].trim()) return [];
-    gitDir = path.resolve(workspaceDir, gitdir[1]);
     const gitDirPath = path.isAbsolute(gitdir[1]) ? gitdir[1] : `${workspaceDir}/${gitdir[1]}`;
-    if (await fs.realpath(gitDirPath) !== gitDir) return [];
-    const commonFile = path.join(gitDir, "commondir");
-    if (!(await fs.lstat(commonFile)).isFile() || await fs.realpath(commonFile) !== commonFile) return [];
+    gitDir = await resolvePath(gitDirPath, true);
+    const commonFile = await resolvePath(path.join(gitDir, "commondir"), false);
     const commondir = /^([^\0\r\n]+)\r?\n?$/.exec(await fs.readFile(commonFile, "utf8"));
     if (!commondir || !commondir[1].trim()) return [];
-    commonDir = path.resolve(gitDir, commondir[1]);
-    if (gitDir.trim() !== gitDir || commonDir.trim() !== commonDir) return [];
     const commonDirPath = path.isAbsolute(commondir[1]) ? commondir[1] : `${gitDir}/${commondir[1]}`;
-    if (await fs.realpath(commonDirPath) !== commonDir) return [];
-    const worktreesDir = path.join(commonDir, "worktrees");
+    commonDir = await resolvePath(commonDirPath, true);
+    if (gitDir.trim() !== gitDir || commonDir.trim() !== commonDir) return [];
+    worktreesDir = await resolvePath(path.join(commonDir, "worktrees"), true);
     if (path.dirname(gitDir) !== worktreesDir) return [];
-    for (const directory of [commonDir, worktreesDir, gitDir]) {
-      if (!(await fs.lstat(directory)).isDirectory() || await fs.realpath(directory) !== directory) return [];
-    }
   } catch {
     // Unreadable or unrecognized Git metadata must not grant additional access.
     return [];
   }
-  const hooks = path.join(commonDir, "hooks");
-  const config = path.join(commonDir, "config");
-  for (const protectedPath of [hooks, config]) {
-    const stat = await fs.lstat(protectedPath).catch(() => null);
-    const expectedType = protectedPath === hooks ? stat?.isDirectory() : stat?.isFile();
-    if (!expectedType || await fs.realpath(protectedPath).catch(() => null) !== protectedPath) {
-      throw new Error(`Cannot sandbox Git worktree: "${protectedPath}" must exist with its expected type and no symlinks.`);
-    }
+  const hooks = await resolvePath(path.join(commonDir, "hooks"), true);
+  const config = await resolvePath(path.join(commonDir, "config"), false);
+  try {
+    if (!gitWorktreeConfigDisabled(await fs.readFile(config, "utf8"))) return [];
+  } catch {
+    return [];
   }
-  return [
+  const mounts: LocalProcessSandboxPath[] = [
     { path: commonDir, access: "rw" },
-    { path: path.join(commonDir, "worktrees"), access: "ro" },
+    { path: worktreesDir, access: "ro" },
     { path: gitDir, access: "rw" },
     { path: hooks, access: "ro" },
     { path: config, access: "ro" },
   ];
+  for (const [candidate, directory] of [
+    [path.join(commonDir, "modules"), true],
+    [path.join(commonDir, "config.worktree"), false],
+    [path.join(gitDir, "config.worktree"), false],
+    [path.join(commonDir, "info"), true],
+  ] as const) {
+    const exists = await fs.lstat(candidate).then(() => true).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    });
+    if (exists) mounts.push({ path: await resolvePath(candidate, directory), access: "ro" });
+  }
+  // Recheck immediately before args are built, retaining the initially resolved
+  // paths for binds. A race still exists between arg building and bwrap's mount:
+  // path-based --bind/--ro-bind cannot pin an inode against concurrent replacement.
+  try {
+    for (const { candidate, resolved, directory } of checkedPaths) {
+      const stat = await fs.lstat(candidate);
+      if (stat.isSymbolicLink() || !(directory ? stat.isDirectory() : stat.isFile())
+        || await fs.realpath(candidate) !== resolved) return [];
+    }
+  } catch {
+    return [];
+  }
+  return mounts;
 }
 
 function parentDirectories(candidate: string): string[] {
@@ -447,17 +511,16 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       created.add(alias);
       mounted.add(alias);
     }
-    const mount = async (source: string, access: LocalProcessSandboxAccess, remount = false) => {
+    const addMount = (source: string, access: LocalProcessSandboxAccess) => {
+      addParentDirectories(args, created, source);
+      args.push(access === "rw" ? "--bind" : "--ro-bind", source, source);
+      mounted.add(source);
+      created.add(source);
+    };
+    const mount = async (source: string, access: LocalProcessSandboxAccess) => {
       const normalized = normalizeAbsolutePath(source, "Sandbox path");
-      if (!remount && mounted.has(normalized)) return;
-      if (!(await pathExists(normalized))) {
-        if (remount) throw new Error(`Sandbox path "${normalized}" no longer exists.`);
-        return;
-      }
-      addParentDirectories(args, created, normalized);
-      args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
-      mounted.add(normalized);
-      created.add(normalized);
+      if (mounted.has(normalized) || !(await pathExists(normalized))) return;
+      addMount(normalized, access);
     };
     for (const systemPath of SYSTEM_READ_PATHS) await mount(systemPath, "ro");
     for (const executablePath of await executableReadPaths(input.executable)) await mount(executablePath, "ro");
@@ -468,7 +531,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
     await mount(workspaceDir, "rw");
     // Later binds override earlier ones: protect peers and executable Git metadata.
-    for (const gitPath of await gitWorktreePaths(workspaceDir)) await mount(gitPath.path, gitPath.access, true);
+    for (const gitPath of await gitWorktreePaths(workspaceDir)) addMount(gitPath.path, gitPath.access);
     for (const [index, alias] of (input.options.pathAliases ?? []).entries()) {
       const aliasPath = normalizeAbsolutePath(alias.path, `Sandbox pathAliases[${index}].path`);
       const aliasTarget = normalizeAbsolutePath(alias.target, `Sandbox pathAliases[${index}].target`);
