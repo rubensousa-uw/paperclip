@@ -83,6 +83,53 @@ async function pathExists(candidate: string): Promise<boolean> {
   return fs.lstat(candidate).then(() => true).catch(() => false);
 }
 
+async function gitWorktreePaths(workspaceDir: string): Promise<LocalProcessSandboxPath[]> {
+  const gitFile = path.join(workspaceDir, ".git");
+  if (!(await fs.lstat(gitFile).catch(() => null))?.isFile()) return [];
+  let gitDir: string;
+  let commonDir: string;
+  try {
+    if (await fs.realpath(gitFile) !== gitFile) return [];
+    const gitdir = /^gitdir: ([^\0\r\n]+)\r?\n?$/.exec(await fs.readFile(gitFile, "utf8"));
+    if (!gitdir || !gitdir[1].trim()) return [];
+    gitDir = path.resolve(workspaceDir, gitdir[1]);
+    const gitDirPath = path.isAbsolute(gitdir[1]) ? gitdir[1] : `${workspaceDir}/${gitdir[1]}`;
+    if (await fs.realpath(gitDirPath) !== gitDir) return [];
+    const commonFile = path.join(gitDir, "commondir");
+    if (!(await fs.lstat(commonFile)).isFile() || await fs.realpath(commonFile) !== commonFile) return [];
+    const commondir = /^([^\0\r\n]+)\r?\n?$/.exec(await fs.readFile(commonFile, "utf8"));
+    if (!commondir || !commondir[1].trim()) return [];
+    commonDir = path.resolve(gitDir, commondir[1]);
+    if (gitDir.trim() !== gitDir || commonDir.trim() !== commonDir) return [];
+    const commonDirPath = path.isAbsolute(commondir[1]) ? commondir[1] : `${gitDir}/${commondir[1]}`;
+    if (await fs.realpath(commonDirPath) !== commonDir) return [];
+    const worktreesDir = path.join(commonDir, "worktrees");
+    if (path.dirname(gitDir) !== worktreesDir) return [];
+    for (const directory of [commonDir, worktreesDir, gitDir]) {
+      if (!(await fs.lstat(directory)).isDirectory() || await fs.realpath(directory) !== directory) return [];
+    }
+  } catch {
+    // Unreadable or unrecognized Git metadata must not grant additional access.
+    return [];
+  }
+  const hooks = path.join(commonDir, "hooks");
+  const config = path.join(commonDir, "config");
+  for (const protectedPath of [hooks, config]) {
+    const stat = await fs.lstat(protectedPath).catch(() => null);
+    const expectedType = protectedPath === hooks ? stat?.isDirectory() : stat?.isFile();
+    if (!expectedType || await fs.realpath(protectedPath).catch(() => null) !== protectedPath) {
+      throw new Error(`Cannot sandbox Git worktree: "${protectedPath}" must exist with its expected type and no symlinks.`);
+    }
+  }
+  return [
+    { path: commonDir, access: "rw" },
+    { path: path.join(commonDir, "worktrees"), access: "ro" },
+    { path: gitDir, access: "rw" },
+    { path: hooks, access: "ro" },
+    { path: config, access: "ro" },
+  ];
+}
+
 function parentDirectories(candidate: string): string[] {
   const directories: string[] = [];
   let current = path.dirname(candidate);
@@ -400,9 +447,13 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       created.add(alias);
       mounted.add(alias);
     }
-    const mount = async (source: string, access: LocalProcessSandboxAccess) => {
+    const mount = async (source: string, access: LocalProcessSandboxAccess, remount = false) => {
       const normalized = normalizeAbsolutePath(source, "Sandbox path");
-      if (mounted.has(normalized) || !(await pathExists(normalized))) return;
+      if (!remount && mounted.has(normalized)) return;
+      if (!(await pathExists(normalized))) {
+        if (remount) throw new Error(`Sandbox path "${normalized}" no longer exists.`);
+        return;
+      }
       addParentDirectories(args, created, normalized);
       args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
       mounted.add(normalized);
@@ -416,6 +467,8 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     for (const managedPath of input.options.managedPaths ?? []) await mount(managedPath.path, managedPath.access);
     for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
     await mount(workspaceDir, "rw");
+    // Later binds override earlier ones: protect peers and executable Git metadata.
+    for (const gitPath of await gitWorktreePaths(workspaceDir)) await mount(gitPath.path, gitPath.access, true);
     for (const [index, alias] of (input.options.pathAliases ?? []).entries()) {
       const aliasPath = normalizeAbsolutePath(alias.path, `Sandbox pathAliases[${index}].path`);
       const aliasTarget = normalizeAbsolutePath(alias.target, `Sandbox pathAliases[${index}].target`);

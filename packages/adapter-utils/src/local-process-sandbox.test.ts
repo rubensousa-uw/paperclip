@@ -1,8 +1,10 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildLocalProcessSandboxSpawnTarget,
@@ -14,6 +16,46 @@ import {
 import { runChildProcess } from "./server-utils.js";
 
 const cleanup: string[] = [];
+const execFileAsync = promisify(execFile);
+
+async function createGitWorktree() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-worktree-"));
+  cleanup.push(root);
+  const repository = path.join(root, "repository");
+  const workspace = path.join(root, "workspace");
+  const commonDir = path.join(repository, ".git");
+  const gitDir = path.join(commonDir, "worktrees", "workspace");
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+  await execFileAsync("git", ["init", "--initial-branch=main", repository], { env });
+  await execFileAsync("git", ["-C", repository, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+    "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "Initial"], { env });
+  await execFileAsync("git", ["-C", repository, "worktree", "add", "-b", "own", workspace], { env });
+  await fs.mkdir(path.join(commonDir, "hooks"), { recursive: true });
+  return { workspace, commonDir, gitDir };
+}
+
+function worktreeSandbox(workspace: string) {
+  return buildLocalProcessSandboxSpawnTarget({
+    executable: process.execPath,
+    args: ["-e", "process.exit(0)"],
+    cwd: workspace,
+    options: { workspaceDir: workspace, filesystemScope: "workspace" },
+  });
+}
+
+function expectWorktreeMounts(args: string[], commonDir: string, gitDir: string) {
+  const worktreesDir = path.join(commonDir, "worktrees");
+  const hooks = path.join(commonDir, "hooks");
+  const config = path.join(commonDir, "config");
+  const start = args.lastIndexOf(commonDir) - 2;
+  expect(args.slice(start, start + 15)).toEqual([
+    "--bind", commonDir, commonDir,
+    "--ro-bind", worktreesDir, worktreesDir,
+    "--bind", gitDir, gitDir,
+    "--ro-bind", hooks, hooks,
+    "--ro-bind", config, config,
+  ]);
+}
 
 async function withTmpDir<T>(tmpDir: string, run: () => Promise<T>): Promise<T> {
   const previousTmpDir = process.env.TMPDIR;
@@ -115,6 +157,169 @@ describe("local process sandbox", () => {
       expect(mountTargets).not.toContain(alias);
     }
   });
+
+  it.runIf(process.platform === "linux").each(["absolute", "relative"])(
+    "mounts worktree metadata in order with %s pointers",
+    async (pointers) => {
+      const { workspace, commonDir, gitDir } = await createGitWorktree();
+      if (pointers === "relative") {
+        await fs.writeFile(path.join(workspace, ".git"), `gitdir: ${path.relative(workspace, gitDir)}\n`);
+      } else {
+        await fs.writeFile(path.join(gitDir, "commondir"), `${commonDir}\n`);
+      }
+      const target = await worktreeSandbox(workspace);
+      expectWorktreeMounts(target.args, commonDir, gitDir);
+      expect(target.args.indexOf(workspace)).toBeLessThan(target.args.indexOf(commonDir));
+    },
+  );
+
+  it.runIf(process.platform === "linux")("preserves identical args for a normal checkout or no .git", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-directory-"));
+    cleanup.push(workspace);
+    const baseline = await worktreeSandbox(workspace);
+    await fs.mkdir(path.join(workspace, ".git"));
+    expect((await worktreeSandbox(workspace)).args).toEqual(baseline.args);
+  });
+
+  it.runIf(process.platform === "linux").each(["malformed .git", "missing commondir"])(
+    "adds no mounts for unreadable gitdir metadata: %s",
+    async (scenario) => {
+      const { workspace, commonDir, gitDir } = await createGitWorktree();
+      await fs.rm(path.join(workspace, ".git"));
+      const baseline = await worktreeSandbox(workspace);
+      await fs.writeFile(path.join(workspace, ".git"), scenario === "malformed .git" ? "invalid\n" : `gitdir: ${gitDir}\n`);
+      if (scenario === "missing commondir") await fs.rm(path.join(gitDir, "commondir"));
+      const target = await worktreeSandbox(workspace);
+      expect(target.args).toEqual(baseline.args);
+      expect(target.args).not.toContain(commonDir);
+    },
+  );
+
+  it.runIf(process.platform === "linux").each(["hooks", "config"])(
+    "rejects missing %s before mounting writable common metadata",
+    async (entry) => {
+      const { workspace, commonDir } = await createGitWorktree();
+      await fs.rm(path.join(commonDir, entry), { recursive: true });
+      await expect(worktreeSandbox(workspace)).rejects.toThrow(`"${path.join(commonDir, entry)}" must exist`);
+    },
+  );
+
+  it.runIf(process.platform === "linux").each([
+    "empty gitdir", "multiline gitdir", "missing gitdir", "empty commondir", "multiline commondir", "wrong layout",
+    "gitdir trailing space", "common trailing space",
+    "gitdir symlink traversal", "commondir symlink traversal",
+    ".git symlink", "commondir symlink", "gitdir symlink", "worktrees symlink", "common symlink",
+  ])("adds no mounts for invalid worktree metadata: %s", async (scenario) => {
+    const { workspace, commonDir, gitDir } = await createGitWorktree();
+    const gitFile = path.join(workspace, ".git");
+    const commonFile = path.join(gitDir, "commondir");
+    await fs.rm(gitFile);
+    const baseline = await worktreeSandbox(workspace);
+    await fs.writeFile(gitFile, `gitdir: ${gitDir}\n`);
+    if (scenario === "empty gitdir") await fs.writeFile(gitFile, "gitdir: \n");
+    if (scenario === "multiline gitdir") await fs.writeFile(gitFile, `gitdir: ${gitDir}\nextra\n`);
+    if (scenario === "missing gitdir") await fs.rm(gitDir, { recursive: true });
+    if (scenario === "empty commondir") await fs.writeFile(commonFile, "\n");
+    if (scenario === "multiline commondir") await fs.writeFile(commonFile, "../..\nextra\n");
+    if (scenario === "wrong layout") await fs.writeFile(commonFile, "../../..\n");
+    if (scenario === "gitdir trailing space") {
+      await fs.rename(gitDir, `${gitDir} `);
+      await fs.writeFile(gitFile, `gitdir: ${gitDir} \n`);
+    }
+    if (scenario === "common trailing space") {
+      await fs.rename(commonDir, `${commonDir} `);
+      await fs.writeFile(gitFile, `gitdir: ${path.join(`${commonDir} `, "worktrees", "workspace")}\n`);
+    }
+    if (scenario === "gitdir symlink traversal" || scenario === "commondir symlink traversal") {
+      await fs.mkdir(path.join(workspace, "deep"));
+      if (scenario === "gitdir symlink traversal") {
+        const link = path.join(path.dirname(workspace), "link");
+        await fs.symlink(path.join(workspace, "deep"), link);
+        await fs.writeFile(gitFile, `gitdir: ${link}/../repository/.git/worktrees/workspace\n`);
+      } else {
+        await fs.symlink(path.join(workspace, "deep"), path.join(commonDir, "link"));
+        await fs.writeFile(commonFile, `${commonDir}/link/..\n`);
+      }
+    }
+    const symlinkPaths: Record<string, string> = {
+      ".git symlink": gitFile,
+      "commondir symlink": commonFile,
+      "gitdir symlink": gitDir,
+      "worktrees symlink": path.dirname(gitDir),
+      "common symlink": commonDir,
+    };
+    const symlinkPath = symlinkPaths[scenario];
+    if (symlinkPath) {
+      await fs.rename(symlinkPath, `${symlinkPath}-real`);
+      await fs.symlink(`${symlinkPath}-real`, symlinkPath);
+    }
+    expect((await worktreeSandbox(workspace)).args).toEqual(baseline.args);
+  });
+
+  it.runIf(process.platform === "linux").each(["hooks", "config"])(
+    "rejects symlinked %s before mounting writable common metadata",
+    async (entry) => {
+      const { workspace, commonDir } = await createGitWorktree();
+      const protectedPath = path.join(commonDir, entry);
+      await fs.rename(protectedPath, `${protectedPath}-real`);
+      await fs.symlink(`${protectedPath}-real`, protectedPath);
+      await expect(worktreeSandbox(workspace)).rejects.toThrow(`"${protectedPath}" must exist`);
+    },
+  );
+
+  it.runIf(process.platform === "linux")("reapplies ordered worktree mounts after overlapping managed paths", async () => {
+    const { workspace, commonDir, gitDir } = await createGitWorktree();
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: [],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace",
+        managedPaths: [
+          { path: commonDir, access: "ro" },
+          { path: gitDir, access: "rw" },
+          { path: path.join(commonDir, "config"), access: "rw" },
+        ],
+      },
+    });
+    expectWorktreeMounts(target.args, commonDir, gitDir);
+  });
+
+  it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(
+    "rejects writes to hooks, config and peer worktrees with EROFS while allowing own metadata writes",
+    async () => {
+      const { workspace, commonDir, gitDir } = await createGitWorktree();
+      const peer = path.join(commonDir, "worktrees", "peer");
+      await fs.mkdir(peer);
+      const target = await worktreeSandbox(workspace);
+      expectWorktreeMounts(target.args, commonDir, gitDir);
+      const script = [
+        "const fs = require('node:fs');",
+        `for (const file of ${JSON.stringify([path.join(commonDir, "hooks", "x"), path.join(commonDir, "config"), path.join(peer, "x")])}) {`,
+        "  try { fs.writeFileSync(file, 'forbidden'); process.exit(9); } catch (error) {",
+        "    if (error.code !== 'EROFS') throw error;",
+        "  }",
+        "}",
+        `fs.writeFileSync(${JSON.stringify(path.join(gitDir, "own-ok"))}, 'ok');`,
+        `fs.writeFileSync(${JSON.stringify(path.join(commonDir, "common-ok"))}, 'ok');`,
+      ].join("\n");
+      const result = await runChildProcess("git-worktree-sandbox-test", process.execPath, ["-e", script], {
+        cwd: workspace,
+        env: {},
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+        localProcessSandbox: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          command: process.env.PAPERCLIP_TEST_BWRAP,
+        },
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      await expect(fs.readFile(path.join(gitDir, "own-ok"), "utf8")).resolves.toBe("ok");
+    },
+  );
 
   it.runIf(process.platform === "linux")("binds a confined absolute alias to the synchronized workspace", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-alias-"));
