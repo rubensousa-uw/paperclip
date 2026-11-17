@@ -118,7 +118,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     );
   }
 
-  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void>; withIdentity?: boolean }) {
+  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void>; withIdentity?: boolean; localNetworkScope?: string }) {
     const rootDir = await mkdtemp(
       path.join(os.tmpdir(), "paperclip-codex-copyback-e2e-"),
     );
@@ -160,6 +160,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
         // External CODEX_HOME (outside the managed company tree) so no managed
         // seeding rewrites auth.json before teardown; equals the shared host home.
         env: { CODEX_HOME: sharedHostHome, ...(input.withIdentity ? { MY_SERVICE_TOKEN: "assigned-tool-token" } : {}) },
+        ...(input.localNetworkScope ? { networkScope: input.localNetworkScope } : {}),
       },
       context: {
         paperclipWorkspace: {
@@ -167,7 +168,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
           source: "project_primary",
         },
       },
-      executionTransport: {
+      ...(input.localNetworkScope ? {} : { executionTransport: {
         remoteExecution: {
           host: "127.0.0.1",
           port: 2222,
@@ -178,7 +179,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
           knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
           strictHostKeyChecking: true,
         },
-      },
+      } }),
       onLog: async () => {},
     });
 
@@ -204,6 +205,15 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     expect(keys).not.toContain("HOST_DATABASE_PASSWORD");
     expect(commandArgs.join(" ")).not.toContain("assigned-run-token");
     expect(commandArgs.join(" ")).not.toContain("assigned-tool-token");
+  });
+
+  it.each([["allowlist", true], ["deny", false]])("allows the sandbox proxy names in CLI shells only for the allowlist network (%s)", async (scope, allowed) => {
+    const { commandArgs } = await runTeardown({ sandboxAuth: "{}", hostAuth: "{}", withIdentity: true, localNetworkScope: scope });
+    const policy = commandArgs.find(arg => arg.startsWith("shell_environment_policy.include_only="));
+    const keys: string[] = JSON.parse(policy!.slice(policy!.indexOf("=") + 1));
+    const proxyNames = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"];
+    if (allowed) expect(keys).toEqual(expect.arrayContaining(proxyNames));
+    else for (const name of proxyNames) expect(keys).not.toContain(name);
   });
 
   it("collects stopped-provider instruction edits before a throwing remote restore", async () => {
