@@ -1,6 +1,6 @@
 {
-  "id": "a7c9681c-fb33-47c3-8139-3d88d7bbfe19",
-  "prevId": "9fa514b5-5cd1-4350-9b77-f60924655298",
+  "id": "940d340a-69f3-44c8-b4f0-f74ef09b1599",
+  "prevId": "945c31ed-f39f-4272-a91d-85de925f5361",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -8252,6 +8252,24 @@
       "name": "case_handoffs",
       "schema": "",
       "columns": {
+        "workflow_transition": {
+          "name": "workflow_transition",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "workflow_prompt": {
+          "name": "workflow_prompt",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "base_workflow_document_revision_id": {
+          "name": "base_workflow_document_revision_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
         "id": {
           "name": "id",
           "type": "uuid",
@@ -9067,6 +9085,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "workflow_id": {
+          "name": "workflow_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
         "handoff_version": {
           "name": "handoff_version",
           "type": "integer",
@@ -9403,6 +9427,19 @@
           "tableTo": "issues",
           "columnsFrom": [
             "work_issue_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "cases_workflow_id_workflows_id_fk": {
+          "name": "cases_workflow_id_workflows_id_fk",
+          "tableFrom": "cases",
+          "tableTo": "workflows",
+          "columnsFrom": [
+            "workflow_id"
           ],
           "columnsTo": [
             "id"
@@ -28436,6 +28473,250 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.execution_workspace_restore_points": {
+      "name": "execution_workspace_restore_points",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "execution_workspace_id": {
+          "name": "execution_workspace_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_issue_id": {
+          "name": "source_issue_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "generation": {
+          "name": "generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "checkout_name": {
+          "name": "checkout_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
+        "object_key": {
+          "name": "object_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "sha256": {
+          "name": "sha256",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "byte_size": {
+          "name": "byte_size",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'pending'"
+        },
+        "activated_at": {
+          "name": "activated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "tree_closed_at": {
+          "name": "tree_closed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "delete_after": {
+          "name": "delete_after",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "review_generation": {
+          "name": "review_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_error": {
+          "name": "last_error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "execution_workspace_restore_points_object_key_uniq": {
+          "name": "execution_workspace_restore_points_object_key_uniq",
+          "columns": [
+            {
+              "expression": "object_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "execution_workspace_restore_points_live_checkout_uniq": {
+          "name": "execution_workspace_restore_points_live_checkout_uniq",
+          "columns": [
+            {
+              "expression": "execution_workspace_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "generation",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "checkout_name",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"execution_workspace_restore_points\".\"status\" <> 'deleted'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "execution_workspace_restore_points_status_delete_after_idx": {
+          "name": "execution_workspace_restore_points_status_delete_after_idx",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "delete_after",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "execution_workspace_restore_points_company_idx": {
+          "name": "execution_workspace_restore_points_company_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "execution_workspace_restore_points_source_issue_idx": {
+          "name": "execution_workspace_restore_points_source_issue_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "source_issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "execution_workspace_restore_points_active_source_idx": {
+          "name": "execution_workspace_restore_points_active_source_idx",
+          "columns": [
+            {
+              "expression": "source_issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"execution_workspace_restore_points\".\"status\" = 'active'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.execution_workspace_runtime_leases": {
       "name": "execution_workspace_runtime_leases",
       "schema": "",
@@ -34713,6 +34994,13 @@
           "notNull": true,
           "default": "'{}'::jsonb"
         },
+        "sso": {
+          "name": "sso",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",
@@ -38587,6 +38875,18 @@
         "resolved_at": {
           "name": "resolved_at",
           "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "dismissed_at": {
+          "name": "dismissed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "dismissed_by_user_id": {
+          "name": "dismissed_by_user_id",
+          "type": "text",
           "primaryKey": false,
           "notNull": false
         },
@@ -59277,6 +59577,113 @@
           "value": "\"work_assessments\".\"trigger_actor_company_id\" = \"work_assessments\".\"company_id\""
         }
       },
+      "isRLSEnabled": false
+    },
+    "public.workflows": {
+      "name": "workflows",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "prompt": {
+          "name": "prompt",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_by_agent_id": {
+          "name": "created_by_agent_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_by_user_id": {
+          "name": "created_by_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "workflows_company_idx": {
+          "name": "workflows_company_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "workflows_company_id_companies_id_fk": {
+          "name": "workflows_company_id_companies_id_fk",
+          "tableFrom": "workflows",
+          "tableTo": "companies",
+          "columnsFrom": [
+            "company_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "workflows_created_by_agent_id_agents_id_fk": {
+          "name": "workflows_created_by_agent_id_agents_id_fk",
+          "tableFrom": "workflows",
+          "tableTo": "agents",
+          "columnsFrom": [
+            "created_by_agent_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
       "isRLSEnabled": false
     },
     "public.workspace_operations": {
