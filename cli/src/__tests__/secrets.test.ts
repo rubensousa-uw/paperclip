@@ -107,6 +107,7 @@ function configWithSecretsProvider(provider: PaperclipConfig["secrets"]["provide
     auth: {
       baseUrlMode: "auto",
       disableSignUp: false,
+      ssoProviders: [],
     },
     telemetry: {
       enabled: true,

@@ -1,16 +1,30 @@
 import type { Request, RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "node:http";
-import { betterAuth, type Auth } from "better-auth";
+import { createHash } from "node:crypto";
+import { betterAuth, type Auth, type BetterAuthOptions } from "better-auth";
+import { APIError, getOAuthState } from "better-auth/api";
+import { and, eq, gt, inArray, isNull } from "drizzle-orm";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
+import {
+  genericOAuth,
+  keycloak,
+  auth0,
+  okta,
+  microsoftEntraId,
+} from "better-auth/plugins";
+import type { GenericOAuthConfig } from "better-auth/plugins";
 import type { Db } from "@paperclipai/db";
 import {
   authAccounts,
   authSessions,
   authUsers,
   authVerifications,
+  invites,
 } from "@paperclipai/db";
+import type { SsoProviderConfig, SsoRoleRequirement } from "@paperclipai/shared";
 import type { Config } from "../config.js";
+import { logger } from "../middleware/logger.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
 import {
   workspaceLoginHandoffPlugin,
@@ -44,7 +58,10 @@ type BetterAuthSessionResolver = {
   api?: BetterAuthGetSessionApi;
 };
 
-type BetterAuthInstance = BetterAuthHandlerTarget & BetterAuthSessionResolver;
+type BetterAuthInstance = BetterAuthHandlerTarget & BetterAuthSessionResolver & {
+  $context?: Promise<unknown>;
+  $paperclipSsoProviderIds?: string[];
+};
 
 const AUTH_COOKIE_PREFIX_FALLBACK = "default";
 const AUTH_COOKIE_PREFIX_INVALID_SEGMENTS_RE = /[^a-zA-Z0-9_-]+/g;
@@ -238,6 +255,184 @@ export function resolveWorkspaceHandoffIdentity(
   };
 }
 
+function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
+  try {
+    const parts = jwt.split(".");
+    if (parts.length !== 3) return null;
+    const payload = Buffer.from(parts[1]!, "base64url").toString("utf-8");
+    return JSON.parse(payload) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function resolveClaimAtPath(claims: Record<string, unknown>, path: string): unknown {
+  let current: unknown = claims;
+  for (const segment of path.split(".")) {
+    if (!current || typeof current !== "object") return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+function userHasRequiredRole(
+  claims: Record<string, unknown>,
+  requirement: SsoRoleRequirement,
+): boolean {
+  const value = resolveClaimAtPath(claims, requirement.claimPath);
+  if (Array.isArray(value)) {
+    return requirement.roles.some((role: string) => value.includes(role));
+  }
+  if (typeof value === "string") {
+    return requirement.roles.includes(value);
+  }
+  return false;
+}
+
+function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthConfig {
+  const base = {
+    clientId: provider.clientId,
+    clientSecret: provider.clientSecret,
+    ...(provider.scopes ? { scopes: provider.scopes } : {}),
+  };
+
+  let baseConfig: GenericOAuthConfig;
+  switch (provider.type) {
+    case "keycloak":
+      baseConfig = keycloak({ ...base, issuer: provider.issuer! });
+      break;
+    case "auth0":
+      baseConfig = auth0({
+        ...base,
+        clientId: provider.clientId,
+        clientSecret: provider.clientSecret,
+        domain: provider.domain ?? new URL(provider.issuer!).hostname,
+      });
+      break;
+    case "okta":
+      baseConfig = okta({ ...base, issuer: provider.issuer! });
+      break;
+    case "microsoft_entra_id":
+      baseConfig = microsoftEntraId({ ...base, tenantId: provider.tenantId! });
+      break;
+    case "oidc":
+      baseConfig = {
+        providerId: provider.providerId,
+        discoveryUrl: provider.discoveryUrl!,
+        ...base,
+        scopes: provider.scopes?.length ? provider.scopes : ["openid", "email", "profile"],
+      };
+      break;
+  }
+
+  baseConfig.disableImplicitSignUp = true;
+  baseConfig.discoveryFetchOptions = { timeout: SSO_DISCOVERY_BOOT_TIMEOUT_MS };
+  return withRoleRestrictedUserInfo(baseConfig, provider);
+}
+
+export function withRoleRestrictedUserInfo(
+  baseConfig: GenericOAuthConfig,
+  provider: SsoProviderConfig,
+): GenericOAuthConfig {
+  if (!provider.requiredRoles) {
+    return baseConfig;
+  }
+
+  const requirement = provider.requiredRoles;
+  const upstreamGetUserInfo = baseConfig.getUserInfo;
+
+  baseConfig.getUserInfo = async (tokens) => {
+    const rawTokens = tokens.raw as Record<string, unknown> | undefined;
+    const idToken = (tokens as Record<string, unknown>).idToken as string | undefined
+      ?? rawTokens?.id_token as string | undefined;
+    const accessToken = (tokens as Record<string, unknown>).accessToken as string | undefined
+      ?? rawTokens?.access_token as string | undefined;
+
+    let hasRole = false;
+
+    if (idToken) {
+      const claims = decodeJwtPayload(idToken);
+      if (claims && userHasRequiredRole(claims, requirement)) {
+        hasRole = true;
+      }
+    }
+
+    if (!hasRole && accessToken) {
+      const claims = decodeJwtPayload(accessToken);
+      if (claims && userHasRequiredRole(claims, requirement)) {
+        hasRole = true;
+      }
+    }
+
+    if (idToken || accessToken) {
+      if (!hasRole) {
+        logger.warn(
+          {
+            providerId: provider.providerId,
+            claimPath: requirement.claimPath,
+            requiredRoles: requirement.roles,
+          },
+          "SSO login rejected: user does not have required role",
+        );
+        return null;
+      }
+    } else {
+      logger.warn(
+        { providerId: provider.providerId },
+        "SSO role check skipped: no id_token or access_token in response — access denied",
+      );
+      return null;
+    }
+
+    if (upstreamGetUserInfo) {
+      return upstreamGetUserInfo(tokens);
+    }
+    // Better Auth only falls back to its own user-info resolution when the
+    // provider config has NO getUserInfo at all — and this wrapper is one.
+    // Replicate its id_token fallback here (same shape as the plugin's
+    // getUserInfo), otherwise every role-restricted provider whose helper
+    // does not define getUserInfo fails with "user_info_is_missing".
+    if (idToken) {
+      const claims = decodeJwtPayload(idToken);
+      if (claims && typeof claims.sub === "string" && typeof claims.email === "string") {
+        return {
+          id: claims.sub,
+          emailVerified: Boolean(claims.email_verified),
+          image: typeof claims.picture === "string" ? claims.picture : undefined,
+          ...claims,
+        } as Awaited<ReturnType<NonNullable<GenericOAuthConfig["getUserInfo"]>>>;
+      }
+    }
+    logger.warn(
+      { providerId: provider.providerId },
+      "SSO login rejected: id_token lacks sub/email claims and provider has no getUserInfo",
+    );
+    return null;
+  };
+
+  return baseConfig;
+}
+
+function inviteTokenFromAuthUrl(raw: unknown, baseURL: string): string | null {
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const origin = new URL(baseURL).origin;
+    let url = new URL(raw, origin);
+    if (url.origin !== origin) return null;
+    // InviteLanding sends OAuth back through /auth?next=/invite/<token>.
+    if (url.pathname === "/auth") {
+      const next = url.searchParams.get("next");
+      if (!next) return null;
+      url = new URL(next, origin);
+    }
+    if (url.origin !== origin) return null;
+    const match = /^\/invite\/([^/]+)\/?$/.exec(url.pathname);
+    return match ? decodeURIComponent(match[1]!) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
@@ -257,7 +452,10 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     publicUrl,
   });
 
-  const authConfig = {
+  const oauthConfigs = config.ssoProviders.map(mapSsoProviderToOAuthConfig);
+  const plugins = oauthConfigs.length > 0 ? [genericOAuth({ config: oauthConfigs })] : [];
+
+  const authConfig: Record<string, unknown> = {
     baseURL: baseUrl,
     secret,
     trustedOrigins,
@@ -270,11 +468,62 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
         verification: authVerifications,
       },
     }),
+    databaseHooks: {
+      user: {
+        create: {
+          before: async (user, ctx) => {
+            // Invites are bearer links, with no target-email column. Require
+            // possession of a specific pending human invite, not just any row.
+            // OAuth state has already been validated by Better Auth here.
+            const oauthState = ctx ? await getOAuthState() : null;
+            const inviteUrl = oauthState?.callbackURL
+              ?? (ctx?.path === "/sign-up/email"
+                ? ctx.body?.callbackURL ?? ctx.headers?.get("referer")
+                : null);
+            const token = ctx ? inviteTokenFromAuthUrl(inviteUrl, ctx.context.baseURL) : null;
+            if (token) {
+              const [invite] = await db
+                .select({ id: invites.id })
+                .from(invites)
+                .where(and(
+                  eq(invites.tokenHash, createHash("sha256").update(token).digest("hex")),
+                  inArray(invites.inviteType, ["company_join", "bootstrap_ceo"]),
+                  inArray(invites.allowedJoinTypes, ["human", "both"]),
+                  isNull(invites.acceptedAt),
+                  isNull(invites.revokedAt),
+                  gt(invites.expiresAt, new Date()),
+                ))
+                .limit(1);
+              // Acceptance still consumes the invite and grants membership (or
+              // the bootstrap admin role) after authentication has completed.
+              if (invite) return;
+            }
+            logger.warn({ email: user.email }, "Account creation rejected: a pending invite is required");
+            throw new APIError("FORBIDDEN", {
+              code: "INVITE_REQUIRED",
+              message: "A valid, pending invite is required to create an account. Open your invite link and try again.",
+            });
+          },
+        },
+      },
+    } satisfies NonNullable<BetterAuthOptions["databaseHooks"]>,
     emailAndPassword: {
       enabled: true,
       requireEmailVerification: false,
       disableSignUp: config.authDisableSignUp,
     },
+    ...(plugins.length > 0 ? { plugins } : {}),
+    ...(oauthConfigs.length > 0
+      ? {
+          account: {
+            accountLinking: {
+              enabled: true,
+              requireLocalEmailVerified: false,
+              trustedProviders: config.ssoProviders.map((p) => p.providerId),
+            },
+          },
+        }
+      : {}),
     rateLimit: buildBetterAuthRateLimitOptions({
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -287,6 +536,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     ...(resolveWorkspaceHandoffIdentity(config)
       ? {
           plugins: [
+            ...plugins,
             workspaceLoginHandoffPlugin({
               db,
               // Re-resolved per exchange so a hot restart cannot keep validating
@@ -306,10 +556,10 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
   };
 
   if (!baseUrl) {
-    delete (authConfig as { baseURL?: string }).baseURL;
+    delete authConfig.baseURL;
   }
 
-  const defaultAuth = betterAuth(authConfig);
+  const defaultAuth = betterAuth(authConfig as Parameters<typeof betterAuth>[0]);
   const supportsManagedLoopbackAuth = Boolean(
     !disableSecureCookies &&
     isHttpsUrl(publicUrl) &&
@@ -323,7 +573,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
   const loopbackAuth = betterAuth({
     ...authConfig,
     advanced: buildBetterAuthAdvancedOptions({ disableSecureCookies: true }),
-  });
+  } as Parameters<typeof betterAuth>[0]);
   const cookieSecurityInput = {
     deploymentMode: config.deploymentMode,
     deploymentExposure: config.deploymentExposure,
@@ -334,6 +584,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
   };
 
   return {
+    $context: Promise.all([defaultAuth.$context, loopbackAuth.$context]).then(() => undefined),
     handler: (request) => {
       const auth = shouldDisableSecureAuthCookies({
         ...cookieSecurityInput,
@@ -358,6 +609,193 @@ export function createBetterAuthHandler(auth: BetterAuthHandlerTarget): RequestH
   return (req, res, next) => {
     void Promise.resolve(handler(req, res)).catch(next);
   };
+}
+
+export interface BetterAuthManager {
+  handler: RequestHandler;
+  fetch: (request: globalThis.Request) => Promise<Response>;
+  resolveSession: (req: Request) => Promise<BetterAuthSessionResult | null>;
+  resolveSessionFromHeaders: (headers: Headers) => Promise<BetterAuthSessionResult | null>;
+  rebuild: (ssoProviders: SsoProviderConfig[]) => Promise<void>;
+}
+
+export const SSO_DISCOVERY_BOOT_TIMEOUT_MS = 10_000;
+export const SSO_DISCOVERY_READINESS_GUARD_MS = SSO_DISCOVERY_BOOT_TIMEOUT_MS + 5_000;
+const SSO_RECOVERY_COOLDOWN_MS = 60_000;
+
+export interface BetterAuthManagerOptions {
+  discoveryTimeoutMs?: number;
+  now?: () => number;
+}
+
+class SsoDiscoveryReadinessTimeout extends Error {}
+
+function isDiscoveryTimeout(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { name, code } = error as { name?: unknown; code?: unknown };
+  // better-fetch propagates the fetch signal's DOMException; jose wraps its
+  // remote JWKS timeout in JWKSTimeout. Match identities, not error messages.
+  return name === "TimeoutError" || name === "AbortError" ||
+    name === "JWKSTimeout" || code === "ERR_JWKS_TIMEOUT";
+}
+
+function isDiscoveryFailure(error: unknown): string | null {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Provider "([^"]+)": discovery (?:returned no valid data|did not return an issuer)/.exec(message)?.[1] ?? null;
+}
+
+async function createReadyBetterAuthInstance(
+  db: Db,
+  config: Config,
+  trustedOrigins: string[],
+  timeoutMs = SSO_DISCOVERY_READINESS_GUARD_MS,
+): Promise<BetterAuthInstance> {
+  let providers = [...config.ssoProviders];
+  const originalProviderIds = new Set(providers.map((provider) => provider.providerId));
+  while (true) {
+    const auth = createBetterAuthInstance(db, { ...config, ssoProviders: providers }, trustedOrigins);
+    try {
+      // genericOAuth performs discovery from its async plugin init. Await it
+      // before the server considers auth ready so a rejected init cannot escape
+      // as an unhandled promise rejection after the listener starts.
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          auth.$context,
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => {
+              reject(new SsoDiscoveryReadinessTimeout("SSO discovery readiness timed out"));
+            }, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+      auth.$paperclipSsoProviderIds = [...providers]
+        .filter((provider) => originalProviderIds.has(provider.providerId))
+        .map((provider) => provider.providerId);
+      return auth;
+    } catch (error) {
+      const failedProviderId = isDiscoveryFailure(error);
+      const failedProviderIds = failedProviderId
+        ? [failedProviderId]
+        // Normally genericOAuth attributes discovery failures to a provider.
+        // This guard (or an unattributed fetch/JWKS timeout) cannot identify one
+        // provider, so rebuild with password auth and no SSO providers.
+        : error instanceof SsoDiscoveryReadinessTimeout || isDiscoveryTimeout(error)
+          ? providers.map((provider) => provider.providerId)
+          : [];
+      const droppedProviderIds = failedProviderIds.filter((providerId) =>
+        providers.some((provider) => provider.providerId === providerId),
+      );
+      if (droppedProviderIds.length === 0) {
+        throw error;
+      }
+      for (const providerId of droppedProviderIds) {
+        logger.warn(
+          { providerId },
+          "SSO provider disabled because OIDC discovery failed",
+        );
+      }
+      providers = providers.filter((provider) => !droppedProviderIds.includes(provider.providerId));
+      // A timed out context may still reject after it is abandoned. Keep a
+      // rejection handler attached even though readiness has moved on.
+      void auth.$context?.catch(() => undefined);
+    }
+  }
+}
+
+export async function createBetterAuthManager(
+  db: Db,
+  config: Config,
+  trustedOrigins: string[],
+  options: BetterAuthManagerOptions = {},
+): Promise<BetterAuthManager> {
+  const timeoutMs = options.discoveryTimeoutMs ?? SSO_DISCOVERY_READINESS_GUARD_MS;
+  const now = options.now ?? Date.now;
+  let configuredProviders = [...config.ssoProviders];
+  let installedProviders = [...config.ssoProviders];
+  let generation = 0;
+  let currentAuth = await createReadyBetterAuthInstance(db, config, trustedOrigins, timeoutMs);
+  installedProviders = config.ssoProviders.filter((provider) =>
+    currentAuth.$paperclipSsoProviderIds?.includes(provider.providerId),
+  );
+  let currentHandler = toNodeHandler(currentAuth);
+  let recoveryPromise: Promise<void> | null = null;
+  let lastRecoveryAt = Number.NEGATIVE_INFINITY;
+
+  const rebuild = async (ssoProviders: SsoProviderConfig[]): Promise<void> => {
+    const rebuildGeneration = ++generation;
+    configuredProviders = [...ssoProviders];
+    const updatedConfig = { ...config, ssoProviders };
+    const readyAuth = await createReadyBetterAuthInstance(db, updatedConfig, trustedOrigins, timeoutMs);
+    if (rebuildGeneration !== generation) return;
+    currentAuth = readyAuth;
+    installedProviders = ssoProviders.filter((provider) =>
+      readyAuth.$paperclipSsoProviderIds?.includes(provider.providerId),
+    );
+    currentHandler = toNodeHandler(currentAuth);
+    logger.info(
+      { providers: ssoProviders.map((p) => p.providerId) },
+      "Better Auth instance rebuilt with updated SSO providers",
+    );
+  };
+
+  const recoverDroppedProvider = (): Promise<void> => {
+    if (recoveryPromise) return recoveryPromise;
+    if (now() - lastRecoveryAt < SSO_RECOVERY_COOLDOWN_MS) return Promise.resolve();
+    lastRecoveryAt = now();
+    const attempt = rebuild(configuredProviders);
+    recoveryPromise = attempt.finally(() => {
+      if (recoveryPromise === wrapped) recoveryPromise = null;
+    });
+    const wrapped = recoveryPromise;
+    return wrapped;
+  };
+
+  const providerFromBody = (body: unknown, path: string): string | null => {
+    if (!body || typeof body !== "object") return null;
+    const value = body as Record<string, unknown>;
+    const provider = path.endsWith("/sign-in/oauth2") ? value.providerId : value.provider;
+    return typeof provider === "string" ? provider : null;
+  };
+
+  const shouldRecover = async (providerId: string | null): Promise<boolean> => {
+    if (!providerId || !configuredProviders.some((provider) => provider.providerId === providerId) ||
+        installedProviders.some((provider) => provider.providerId === providerId)) return false;
+    await recoverDroppedProvider().catch(() => undefined);
+    return installedProviders.some((provider) => provider.providerId === providerId);
+  };
+
+  const handleFetch = async (request: globalThis.Request): Promise<Response> => {
+    const url = new URL(request.url);
+    if (request.method === "POST" && /\/sign-in\/(?:oauth2|social)$/.test(url.pathname)) {
+      let body: unknown;
+      try { body = await request.clone().json(); } catch { /* Better Auth handles malformed input. */ }
+      await shouldRecover(providerFromBody(body, url.pathname));
+    }
+    return currentAuth.handler(request);
+  };
+
+  const manager: BetterAuthManager = {
+    handler: (req, res, next) => {
+      const path = req.url.split("?")[0] ?? "";
+      const providerId = req.method === "POST" && /\/sign-in\/(?:oauth2|social)$/.test(path)
+        ? providerFromBody(req.body, path)
+        : null;
+      void (async () => {
+        await shouldRecover(providerId);
+        await currentHandler(req, res);
+      })().catch(next);
+    },
+    fetch: handleFetch,
+    resolveSession: (req) => resolveBetterAuthSession(currentAuth, req),
+    resolveSessionFromHeaders: (headers) =>
+      resolveBetterAuthSessionFromHeaders(currentAuth, headers),
+    rebuild,
+  };
+
+  return manager;
 }
 
 export async function resolveBetterAuthSessionFromHeaders(

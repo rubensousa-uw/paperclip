@@ -1,0 +1,59 @@
+diff --git a/dist/plugins/generic-oauth/index.mjs b/dist/plugins/generic-oauth/index.mjs
+index 1d15faae623a1af54423abac6adad840d175d01f..3cfaa4c871bd2150a15b31625755229c4fe48a46 100644
+--- a/dist/plugins/generic-oauth/index.mjs
++++ b/dist/plugins/generic-oauth/index.mjs
+@@ -21,10 +21,16 @@ function isSecretlessTokenEndpointAuth(tokenEndpointAuth) {
+ function isClientSecretTokenEndpointAuth(tokenEndpointAuth) {
+ 	return tokenEndpointAuth?.method === "client_secret_basic" || tokenEndpointAuth?.method === "client_secret_post";
+ }
+-async function fetchDiscovery(url, headers) {
++async function fetchDiscovery(url, headers, options) {
++	const timeout = options?.timeout;
+ 	const result = await betterFetch(url, {
+ 		method: "GET",
+-		headers
++		headers,
++		...(timeout !== void 0 ? {
++			timeout,
++			// better-fetch clears its timeout before consuming the response body.
++			signal: AbortSignal.timeout(timeout)
++		} : {})
+ 	});
+ 	if (result.error || !result.data) return null;
+ 	if (result.data.issuer) try {
+@@ -88,7 +94,7 @@ const genericOAuth = (options) => {
+ 				let isOidc = false;
+ 				let idTokenConfig;
+ 				if (c.discoveryUrl) {
+-					const discovered = await fetchDiscovery(c.discoveryUrl, c.discoveryHeaders).catch((err) => {
++					const discovered = await fetchDiscovery(c.discoveryUrl, c.discoveryHeaders, c.discoveryFetchOptions).catch((err) => {
+ 						ctx.logger.error(`Discovery fetch failed for "${c.providerId}": ${err}`);
+ 						return null;
+ 					});
+@@ -109,7 +115,7 @@ const genericOAuth = (options) => {
+ 								throw new Error(`Provider "${c.providerId}": invalid jwks_uri "${discovered.jwks_uri}" in discovery document.`);
+ 							}
+ 							idTokenConfig = {
+-								jwks: createRemoteJWKSet(jwksUrl),
++								jwks: createRemoteJWKSet(jwksUrl, c.discoveryFetchOptions?.timeout !== void 0 ? { timeoutDuration: c.discoveryFetchOptions.timeout } : void 0),
+ 								issuer: discovered.issuer,
+ 								audience: c.clientId,
+ 								algorithms: isOidc ? signingAlgs : void 0
+diff --git a/dist/plugins/generic-oauth/types.d.mts b/dist/plugins/generic-oauth/types.d.mts
+index 4f21995fc91ca2b49e75a94a8762e7508854762c..354bb0b6ded2176d0bec48b8091878d08b1abfed 100644
+--- a/dist/plugins/generic-oauth/types.d.mts
++++ b/dist/plugins/generic-oauth/types.d.mts
+@@ -224,6 +224,13 @@ interface GenericOAuthConfig<ID extends string = string> {
+    * Useful for providers like Epic that require specific headers (e.g., Epic-Client-ID).
+    */
+   discoveryHeaders?: Record<string, string> | undefined;
++  /**
++   * Timeout in milliseconds for discovery and remote JWKS requests.
++   * When omitted, the fetch libraries retain their default timeout behavior.
++   */
++  discoveryFetchOptions?: {
++    timeout?: number;
++  };
+   /**
+    * Custom headers to include in the authorization request.
+    * Useful for providers like Qonto that require specific headers (e.g., X-Qonto-Staging-Token for local development).

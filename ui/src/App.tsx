@@ -122,6 +122,7 @@ const Secrets = lazy(() => import("./pages/Secrets").then((module) => ({ default
 const CompanyImport = lazy(() => import("./pages/CompanyImport").then((module) => ({ default: module.CompanyImport })));
 const DesignGuide = lazy(() => import("./pages/DesignGuide").then((module) => ({ default: module.DesignGuide })));
 const InstanceExperimentalSettings = lazy(() => import("./pages/InstanceExperimentalSettings").then((module) => ({ default: module.InstanceExperimentalSettings })));
+const InstanceSsoSettings = lazy(() => import("./pages/InstanceSsoSettings").then((module) => ({ default: module.InstanceSsoSettings })));
 const InstanceAccess = lazy(() => import("./pages/InstanceAccess").then((module) => ({ default: module.InstanceAccess })));
 const ProfileSettings = lazy(() => import("./pages/ProfileSettings").then((module) => ({ default: module.ProfileSettings })));
 const PluginManager = lazy(() => import("./pages/PluginManager").then((module) => ({ default: module.PluginManager })));
@@ -253,6 +254,7 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       <Route element={<HiddenSettingsPageGate pageKey="instance.access" />}>
         <Route path="company/settings/instance/access" element={<InstanceAccess />} />
       </Route>
+      <Route path="company/settings/instance/sso" element={<InstanceSsoSettings />} />
       <Route element={<HiddenSettingsPageGate pageKey="instance.experimental" />}>
         <Route path="company/settings/instance/experimental" element={<InstanceExperimentalSettings />} />
       </Route>
