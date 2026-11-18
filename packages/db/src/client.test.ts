@@ -2337,7 +2337,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
         const ssoMigrationHash = await migrationHash(
-          "0306_sso_instance_settings.sql",
+          "0452_lazy_rafael_vega.sql",
         );
 
         // createTempDatabase bootstraps an empty embedded database with every
@@ -2345,7 +2345,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
         const journal = JSON.parse(await fs.promises.readFile(
           new URL("./migrations/meta/_journal.json", import.meta.url), "utf8",
         )) as { entries: Array<{ idx: number; tag: string; when: number }> };
-        expect(journal.entries.at(-1)).toMatchObject({ idx: 306, tag: "0306_sso_instance_settings" });
+        expect(journal.entries.at(-1)).toMatchObject({ idx: 452, tag: "0452_lazy_rafael_vega" });
         expect(journal.entries.at(-1)!.when).toBeGreaterThan(journal.entries.at(-2)!.when);
         const expectedHashes = await Promise.all(
           journal.entries.map((entry) => migrationHash(`${entry.tag}.sql`)),
