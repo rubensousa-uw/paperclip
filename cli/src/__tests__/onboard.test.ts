@@ -52,6 +52,7 @@ function createExistingConfigFixture() {
     auth: {
       baseUrlMode: "auto",
       disableSignUp: false,
+      ssoProviders: [],
     },
     telemetry: {
       enabled: true,

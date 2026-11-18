@@ -69,12 +69,14 @@ export async function promptServer(opts?: {
   if (p.isCancel(portStr)) cancelled();
   const port = Number(portStr) || 3100;
   const serveUi = currentServer?.serveUi ?? true;
+  const ssoProviders = currentAuth?.ssoProviders ?? [];
 
   if (bind === "loopback") {
     return buildPresetServerConfig("loopback", {
       port,
       allowedHostnames: [],
       serveUi,
+      ssoProviders,
     });
   }
 
@@ -102,6 +104,7 @@ export async function promptServer(opts?: {
       port,
       allowedHostnames: parseHostnameCsv(allowedHostnamesInput),
       serveUi,
+      ssoProviders,
     });
     if (bind === "tailnet" && isLoopbackHost(preset.server.host)) {
       p.log.warn(TAILNET_BIND_WARNING);
@@ -223,5 +226,6 @@ export async function promptServer(opts?: {
     allowedHostnames,
     serveUi,
     publicBaseUrl,
+    ssoProviders,
   });
 }

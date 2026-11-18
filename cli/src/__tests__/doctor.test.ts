@@ -57,6 +57,7 @@ function createTempConfig(serverPort: number): string {
     auth: {
       baseUrlMode: "auto",
       disableSignUp: false,
+      ssoProviders: [],
     },
     telemetry: {
       enabled: true,
