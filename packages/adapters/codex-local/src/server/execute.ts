@@ -109,6 +109,7 @@ import {
   createCodexAcpExecutor,
   resolveCodexExecutionEngineForRun,
 } from "./acp.js";
+import { codexShellEnvironmentKeys } from "@paperclipai/adapter-utils/codex-shell-environment";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeCodexAcp = createCodexAcpExecutor();
@@ -1232,24 +1233,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
       const args = execArgs.args;
       const pricingContext = execArgs.fastModeApplied ? { serviceTier: "fast" } : undefined;
-      if (ctx.agentIdentity) {
-        const identityNames = ["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"];
-        const shellKeys = [...new Set([
-          "PATH", "HOME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TEMP", "TMP", "CODEX_HOME",
-          // Keep Codex's default secret-name exclusions except for the scoped
-          // Paperclip API token used by the agent skill. Never include host env.
-          ...Object.keys(env).filter(key => key === "PAPERCLIP_API_KEY" || !/key|secret|token/i.test(key)),
-          ...identityNames,
-          // Proxy names stay inheritable before the sandbox injects their values:
-          // Codex 0.164+ applies include_only to exec_command (openai/codex#48096),
-          // and the allowlist proxy is the only egress under --unshare-net.
-          ...(localProcessSandbox?.networkScope === "allowlist"
-            ? ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]
-            : []),
-        ])];
-        args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
-          "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);
-      }
+      const shellKeys = [...new Set([
+        ...codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity)),
+        // Proxy names stay inheritable before the sandbox injects their values:
+        // Codex 0.164+ applies include_only to exec_command (openai/codex#48096),
+        // and the allowlist proxy is the only egress under --unshare-net.
+        ...(localProcessSandbox?.networkScope === "allowlist"
+          ? ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]
+          : []),
+      ])];
+      args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
+        "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);
       const commandNotesWithFastMode =
         execArgs.fastModeIgnoredReason == null
           ? commandNotes
