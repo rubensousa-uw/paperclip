@@ -15,6 +15,7 @@ import {
   evaluateCodexCredentialReadiness,
   mergeManagedCodexMcpGateways,
   isManagedCodexHomePath,
+  materializeSandboxedCodexAuth,
   prepareManagedCodexHome,
   reconcileManagedCodexHome,
   seedManagedCodexHome,
@@ -1508,5 +1509,72 @@ process.stdin.on("end", () => {
       if (staged) await fs.rm(staged, { recursive: true, force: true });
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("materializeSandboxedCodexAuth", () => {
+  const roots: string[] = [];
+  afterEach(async () => {
+    await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+  });
+
+  async function homes() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-sandboxed-auth-"));
+    roots.push(root);
+    const home = path.join(root, "skill-runtimes", "agent-1", "digest");
+    const seedHome = path.join(root, "paperclip-ai-x", "provider");
+    await fs.mkdir(home, { recursive: true });
+    await fs.mkdir(seedHome, { recursive: true });
+    return { root, home, seedHome };
+  }
+
+  it("replaces the seed link with a 0600 copy that stays readable without the seed", async () => {
+    const { home, seedHome } = await homes();
+    const fake = JSON.stringify({ tokens: { account_id: "acct-fake", refresh_token: "fake-refresh" } });
+    await fs.writeFile(path.join(seedHome, "auth.json"), fake, { mode: 0o600 });
+    await fs.symlink(path.join(seedHome, "auth.json"), path.join(home, "auth.json"));
+
+    await expect(materializeSandboxedCodexAuth(home, seedHome)).resolves.toBe(await fs.realpath(path.join(seedHome, "auth.json")));
+
+    // The sandbox does not mount the seed: hide it and read the home alone.
+    await fs.rm(seedHome, { recursive: true });
+    const stat = await fs.lstat(path.join(home, "auth.json"));
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(stat.mode & 0o777).toBe(0o600);
+    expect(await fs.readFile(path.join(home, "auth.json"), "utf8")).toBe(fake);
+    expect((await fs.readdir(home)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("returns the real file when the seed auth.json links on to another home", async () => {
+    const { root, home, seedHome } = await homes();
+    const shared = path.join(root, "shared-codex-home");
+    await fs.mkdir(shared);
+    await fs.writeFile(path.join(shared, "auth.json"), "{\"fake\":true}", { mode: 0o600 });
+    await fs.symlink(path.join(shared, "auth.json"), path.join(seedHome, "auth.json"));
+    await fs.symlink(path.join(seedHome, "auth.json"), path.join(home, "auth.json"));
+
+    await expect(materializeSandboxedCodexAuth(home, seedHome))
+      .resolves.toBe(await fs.realpath(path.join(shared, "auth.json")));
+    expect(await fs.readFile(path.join(home, "auth.json"), "utf8")).toBe("{\"fake\":true}");
+  });
+
+  it("never copies a link that does not name the seed credential", async () => {
+    const { root, home, seedHome } = await homes();
+    const planted = path.join(root, "host-secret");
+    await fs.writeFile(planted, "not-a-credential");
+    await fs.writeFile(path.join(seedHome, "auth.json"), "{}", { mode: 0o600 });
+    await fs.symlink(planted, path.join(home, "auth.json"));
+
+    await expect(materializeSandboxedCodexAuth(home, seedHome)).resolves.toBeNull();
+    expect(await fs.readlink(path.join(home, "auth.json"))).toBe(planted);
+  });
+
+  it("keeps a regular credential and still arms the copy-back to the seed", async () => {
+    const { home, seedHome } = await homes();
+    await fs.writeFile(path.join(seedHome, "auth.json"), "{\"seed\":true}", { mode: 0o600 });
+    await fs.writeFile(path.join(home, "auth.json"), "{\"home\":true}", { mode: 0o600 });
+
+    await expect(materializeSandboxedCodexAuth(home, seedHome)).resolves.toBe(await fs.realpath(path.join(seedHome, "auth.json")));
+    expect(await fs.readFile(path.join(home, "auth.json"), "utf8")).toBe("{\"home\":true}");
   });
 });

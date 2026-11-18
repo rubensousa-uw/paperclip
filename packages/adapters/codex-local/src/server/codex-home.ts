@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
@@ -293,6 +294,32 @@ async function ensureCopiedFile(target: string, source: string): Promise<void> {
   if (existing) return;
   await ensureParentDir(target);
   await fs.copyFile(source, target);
+}
+
+/**
+ * Workspace-scoped bwrap binds only the managed home, so an `auth.json` link to
+ * the seed home dangles inside the sandbox (#18668, #11157). Replace the link
+ * with a 0600 copy of the seed credential. Returns the resolved seed `auth.json`
+ * when the home holds a regular credential for the post-run copy-back, else null.
+ */
+export async function materializeSandboxedCodexAuth(home: string, seedHome: string): Promise<string | null> {
+  const target = path.join(home, "auth.json");
+  const seed = path.join(seedHome, "auth.json");
+  // The seed may itself link on (company home -> ~/.codex): copy back to the real file.
+  const seedFile = await fs.realpath(seed).catch(() => null);
+  if (!seedFile) return null;
+  const existing = await fs.lstat(target).catch(() => null);
+  if (existing?.isFile()) return seedFile;
+  if (!existing?.isSymbolicLink()) return null;
+  // Compare the link text and never follow it: the home is agent-writable, so a
+  // planted link must not copy an arbitrary host file into the sandbox.
+  if (path.resolve(home, await fs.readlink(target)) !== path.resolve(seed)) return null;
+  const bytes = await fs.readFile(seedFile).catch(() => null);
+  if (!bytes) return null;
+  const staged = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  await fs.writeFile(staged, bytes, { mode: 0o600, flag: "wx" });
+  await fs.rename(staged, target);
+  return seedFile;
 }
 
 function tomlString(value: string): string {

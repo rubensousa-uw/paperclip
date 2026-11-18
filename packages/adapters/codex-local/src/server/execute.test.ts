@@ -210,6 +210,45 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     expect(commandArgs.join(" ")).not.toContain("assigned-tool-token");
   });
 
+  it("gives a workspace-sandboxed run a regular auth.json copy and copies a rotation back to the seed (#18668)", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-sandboxed-auth-e2e-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const seedHome = path.join(rootDir, "seed-codex-home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(seedHome, { recursive: true });
+    const seedAuth = subscriptionAuth({ accountId: "acct-fake", lastRefresh: "2026-11-01T00:00:00.000Z", marker: "seed" });
+    const rotatedAuth = subscriptionAuth({ accountId: "acct-fake", lastRefresh: "2026-11-02T00:00:00.000Z", marker: "rotated" });
+    await writeFile(path.join(seedHome, "auth.json"), seedAuth, { mode: 0o600 });
+    savedCodexHomeEnv = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = seedHome;
+    vi.stubEnv("PAPERCLIP_HOME", path.join(rootDir, "paperclip-home"));
+
+    const seen: { isLink: boolean; bytes: string }[] = [];
+    const defaultRun = runChildProcess.getMockImplementation()!;
+    runChildProcess.mockImplementation((async (...args: unknown[]) => {
+      const options = args.find((arg): arg is { env: Record<string, string> } =>
+        typeof arg === "object" && arg !== null && "env" in arg);
+      const homeAuth = path.join(options!.env.CODEX_HOME, "auth.json");
+      seen.push({ isLink: (await lstat(homeAuth)).isSymbolicLink(), bytes: await readFile(homeAuth, "utf8") });
+      // Codex rotates the single-use refresh token inside the sandbox.
+      await writeFile(homeAuth, rotatedAuth, { mode: 0o600 });
+      return { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: 321, startedAt: new Date().toISOString() };
+    }) as never);
+
+    await execute({
+      runId: "run-sandboxed-auth",
+      agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "codex", engine: "cli", filesystemScope: "workspace" },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      onLog: async () => {},
+    }).finally(() => runChildProcess.mockImplementation(defaultRun));
+
+    expect(seen[0]).toEqual({ isLink: false, bytes: seedAuth });
+    expect(await readFile(path.join(seedHome, "auth.json"), "utf8")).toBe(rotatedAuth);
+  });
+
   it.each([["allowlist", true], ["deny", false]])("allows the sandbox proxy names in CLI shells only for the allowlist network (%s)", async (scope, allowed) => {
     const { commandArgs } = await runTeardown({ sandboxAuth: "{}", hostAuth: "{}", withIdentity: true, localNetworkScope: scope });
     const policy = commandArgs.find(arg => arg.startsWith("shell_environment_policy.include_only="));

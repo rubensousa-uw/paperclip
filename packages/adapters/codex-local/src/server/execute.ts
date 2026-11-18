@@ -82,6 +82,7 @@ import {
   pathExists,
   prepareManagedCodexHome,
   resolveManagedCodexHomeDir,
+  materializeSandboxedCodexAuth,
   resolveSharedCodexHomeDir,
   seedManagedCodexHome,
   stageCodexHomeForSync,
@@ -731,10 +732,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       apiKey: configuredOpenAiApiKey,
     });
   }
+  const seedEnv = runtimeSkillDigest ? {
+    ...process.env, CODEX_HOME: runtimeCredentialHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
+  } : process.env;
   if (configuredHomeIsManaged && configuredCodexHome) {
-    const seedEnv = runtimeSkillDigest ? {
-      ...process.env, CODEX_HOME: runtimeCredentialHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
-    } : process.env;
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
     });
@@ -742,6 +743,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
   const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });
+  // A workspace-scoped local sandbox sees only the managed home (#18668, #11157).
+  const sandboxedAuthSeed = !executionTargetIsRemote && (configuredCodexHome == null || configuredHomeIsManaged)
+    && parseLocalProcessFilesystemScope(config.filesystemScope)
+    ? await materializeSandboxedCodexAuth(effectiveCodexHome, resolveSharedCodexHomeDir(seedEnv))
+    : null;
 
   // Never launch a managed CODEX_HOME with no credentials. Without auth.json
   // and with OPENAI_API_KEY="" the provider rejects every request with
@@ -1710,6 +1716,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
   } finally {
+    // The sandboxed copy cannot write a rotated, single-use token through to the
+    // seed, which is what the host (or the server's AI connection) persists.
+    if (sandboxedAuthSeed) {
+      await copyBackCodexAuth({
+        readSandboxAuth: () => fs.readFile(path.join(effectiveCodexHome, "auth.json")),
+        hostAuthPath: sandboxedAuthSeed,
+        log: (line) => onLog("stdout", `${line}\n`),
+      }).catch(async (error) => {
+        await onLog(
+          "stderr",
+          `[paperclip] Codex auth copy-back to "${sandboxedAuthSeed}" failed: ${
+            error instanceof Error ? error.message : String(error)
+          }\n`,
+        );
+      });
+    }
     // Remove the staged CODEX_HOME allowlist temp dir on every exit path
     // (teardown AND error), never only the happy path. Cleanup failure is
     // logged, not fatal — a leaked temp dir must not crash the run.
